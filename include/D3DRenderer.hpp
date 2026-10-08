@@ -55,6 +55,8 @@ public:
     [[nodiscard]] DXGI_FORMAT renderTargetFormat() const { return DXGI_FORMAT_B8G8R8A8_UNORM; }
     [[nodiscard]] UINT frameCount() const { return kFrameCount; }
     [[nodiscard]] UINT srvDescriptorSize() const { return srvDescriptorSize_; }
+    [[nodiscard]] UINT imguiSrvDescriptorCount() const { return kImGuiDescriptorCount; }
+    void waitForIdle() { waitForGpu(); }
 
     [[nodiscard]] HANDLE frameLatencyWaitableObject() const { return frameLatencyWaitableObject_; }
 
@@ -81,6 +83,7 @@ private:
     void waitForGpu();
 
     static constexpr std::uint32_t kFrameCount = 2;
+    static constexpr UINT kImGuiDescriptorCount = 64;
 
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> commandQueue_;

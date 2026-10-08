@@ -1218,7 +1218,9 @@ bool D3DRenderer::createPipelineResources()
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
-    srvDesc.NumDescriptors = 3;
+    // Two video planes plus distinct descriptors for live ImGui textures.
+    // Font atlas growth can keep its old and replacement textures alive together.
+    srvDesc.NumDescriptors = 2u + kImGuiDescriptorCount;
     srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device_->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(srvHeap_.GetAddressOf()))))

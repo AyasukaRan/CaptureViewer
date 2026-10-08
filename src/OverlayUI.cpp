@@ -14,7 +14,9 @@
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
+#include <vector>
 
 extern const unsigned char* const udsgr;
 extern const unsigned int udsgr_size;
@@ -27,6 +29,8 @@ namespace
     {
         D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
         D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+        UINT stride = 0;
+        std::vector<std::uint8_t> allocated;
     };
 
     OverlayDx12DescriptorContext g_overlayDx12DescriptorContext{};
@@ -34,12 +38,41 @@ namespace
     void overlaySrvAlloc(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
     {
         auto* ctx = static_cast<OverlayDx12DescriptorContext*>(info->UserData);
-        *outCpu = ctx->cpu;
-        *outGpu = ctx->gpu;
+        for (std::size_t slot = 0; slot < ctx->allocated.size(); ++slot)
+        {
+            if (ctx->allocated[slot] != 0)
+            {
+                continue;
+            }
+            ctx->allocated[slot] = 1;
+            outCpu->ptr = ctx->cpu.ptr + static_cast<SIZE_T>(slot) * ctx->stride;
+            outGpu->ptr = ctx->gpu.ptr + static_cast<UINT64>(slot) * ctx->stride;
+            return;
+        }
+        IM_ASSERT(false && "ImGui SRV descriptor pool exhausted");
+        // The callback cannot return an error. Never alias a live descriptor,
+        // including in Release builds where IM_ASSERT is disabled.
+        throw std::runtime_error("ImGui SRV descriptor pool exhausted");
     }
 
-    void overlaySrvFree(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE)
+    void overlaySrvFree(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                        D3D12_GPU_DESCRIPTOR_HANDLE gpu)
     {
+        auto* ctx = static_cast<OverlayDx12DescriptorContext*>(info->UserData);
+        if (ctx->stride == 0 || cpu.ptr < ctx->cpu.ptr ||
+            (cpu.ptr - ctx->cpu.ptr) % ctx->stride != 0)
+        {
+            IM_ASSERT(false && "Invalid ImGui SRV descriptor release");
+            return;
+        }
+        const SIZE_T slot = (cpu.ptr - ctx->cpu.ptr) / ctx->stride;
+        if (slot >= ctx->allocated.size() || ctx->allocated[slot] == 0 ||
+            gpu.ptr != ctx->gpu.ptr + static_cast<UINT64>(slot) * ctx->stride)
+        {
+            IM_ASSERT(false && "Invalid or duplicate ImGui SRV descriptor release");
+            return;
+        }
+        ctx->allocated[slot] = 0;
     }
 }
 
@@ -165,6 +198,8 @@ bool OverlayUI::initialize(HWND hwnd, D3DRenderer& renderer)
 
     g_overlayDx12DescriptorContext.cpu = fontCpuHandle_;
     g_overlayDx12DescriptorContext.gpu = fontGpuHandle_;
+    g_overlayDx12DescriptorContext.stride = renderer.srvDescriptorSize();
+    g_overlayDx12DescriptorContext.allocated.assign(renderer.imguiSrvDescriptorCount(), 0);
 
     ImGui_ImplDX12_InitInfo initInfo{};
     initInfo.Device = renderer.device();
@@ -195,9 +230,16 @@ void OverlayUI::shutdown()
         return;
     }
 
+    // Texture/vertex resources and their descriptors must outlive GPU use.
+    // Keep the allocator context intact until backend shutdown frees textures.
+    if (renderer_)
+    {
+        renderer_->waitForIdle();
+    }
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    g_overlayDx12DescriptorContext = {};
 
     initialized_ = false;
     menuVisible_ = false;

@@ -72,6 +72,9 @@ function Save-WindowScreenshot([string]$FileName = 'window.png') {
     try {
         Add-Type -AssemblyName System.Drawing
         Add-Type -AssemblyName System.Windows.Forms
+        $flushResult = [CaptureViewerSmoke.Native]::DwmFlush()
+        if ($flushResult -ne 0) { Write-Report "WARNING: DwmFlush returned $flushResult; screenshot remains best-effort." }
+        Start-Sleep -Milliseconds 100
         $rect = [CaptureViewerSmoke.Native+RECT]::new()
         if (-not [CaptureViewerSmoke.Native]::GetWindowRect($viewerProcess.MainWindowHandle, [ref]$rect)) {
             throw 'Cannot read the viewer window bounds.'
@@ -83,7 +86,7 @@ function Save-WindowScreenshot([string]$FileName = 'window.png') {
         $graphics = [Drawing.Graphics]::FromImage($bitmap)
         $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
         $bitmap.Save((Join-Path $outputPath $FileName), [Drawing.Imaging.ImageFormat]::Png)
-        Write-Report "Screenshot saved: $FileName ($($bounds.Width) x $($bounds.Height)); desktop capture is best-effort."
+        Write-Report "Screenshot saved: $FileName ($($bounds.Width) x $($bounds.Height)); CopyFromScreen after DwmFlush, desktop capture is best-effort."
     }
     catch {
         Write-Report "WARNING: Screenshot unavailable on this runner desktop: $($_.Exception.Message)"
@@ -108,6 +111,8 @@ namespace CaptureViewerSmoke {
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmFlush();
     }
 }
 '@
@@ -124,9 +129,11 @@ namespace CaptureViewerSmoke {
         hasWindowPlacement = $true
         windowWasMaximized = $false
         showLatencyOverlay = $true
-        vsyncEnabled = $false
+        # Synchronize WARP presentation for CI screenshots, independent of the app default.
+        vsyncEnabled = $true
     } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding utf8
 
+    Write-Report 'Screenshot configuration: vsyncEnabled = True in this isolated smoke run; application defaults are unchanged.'
     Write-Report "Starting isolated viewer: $testExecutable"
     $viewerProcess = Start-Process -FilePath $testExecutable -ArgumentList '--no-audio' `
         -WorkingDirectory $runDirectory -PassThru `
@@ -158,6 +165,7 @@ namespace CaptureViewerSmoke {
         Start-Sleep -Milliseconds 100
     } while ($timer.Elapsed.TotalSeconds -lt 10)
     if (-not $renderLoopReady) { throw 'Viewer did not enter its render loop within 10 seconds.' }
+    Wait-Setting 'vsyncEnabled' $true
     Start-Sleep -Milliseconds 500
     Assert-ViewerAlive
     Save-WindowScreenshot 'initial.png'
