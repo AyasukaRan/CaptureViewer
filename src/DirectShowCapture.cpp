@@ -765,7 +765,7 @@ struct DirectShowCaptureImpl
             text << std::fixed << std::setprecision(2) << static_cast<double>(rate) / 100.0;
             return text.str();
         };
-        const auto mediaTypeDeleter = [](AM_MEDIA_TYPE* type) {
+        auto mediaTypeDeleter = [](AM_MEDIA_TYPE* type) {
             if (type)
             {
                 freeMediaType(*type);

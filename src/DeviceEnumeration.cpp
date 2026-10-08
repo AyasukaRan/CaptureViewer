@@ -334,6 +334,14 @@ std::vector<VideoModeInfo> enumerateVideoModes(IAMStreamConfig* streamConfig)
         {
             const auto caps = CaptureCapabilities::streamCaps(capabilityBuffer.data(), capabilityBuffer.size());
             const auto rates = FrameRateOptions::enumerate(info->AvgTimePerFrame, caps.MinFrameInterval, caps.MaxFrameInterval);
+            std::ostringstream details;
+            details << info->bmiHeader.biWidth << "x" << info->bmiHeader.biHeight
+                    << " " << mediaSubtypeName(mediaType->subtype)
+                    << " default=" << std::fixed << std::setprecision(2)
+                    << FrameRateOptions::rateForInterval(info->AvgTimePerFrame) / 100.0 << " FPS"
+                    << " interval100ns=[" << caps.MinFrameInterval << "," << caps.MaxFrameInterval
+                    << "] choices=" << rates.size();
+            logFormatEnum(details.str());
             for (const auto rate : rates)
             {
                 const VideoModeInfo mode{
