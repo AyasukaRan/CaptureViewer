@@ -26,7 +26,7 @@ add_executable(viewer
     third_party/imgui/widgets/imgui_toggle_palette.cpp
     third_party/imgui/widgets/imgui_toggle_presets.cpp
     third_party/imgui/widgets/imgui_toggle_renderer.cpp
-    res/pckvm.ico
+    res/captureviewer.ico
     res/pckvm.rc
 )
 
@@ -58,3 +58,12 @@ target_link_libraries(viewer
 )
 
 set_target_properties(viewer PROPERTIES WIN32_EXECUTABLE TRUE)
+
+include(CTest)
+if(BUILD_TESTING)
+    foreach(test_name VideoViewport FrameTimingStats FrameRateStats)
+        add_executable(${test_name}Tests tests/${test_name}Tests.cpp)
+        target_include_directories(${test_name}Tests PRIVATE include)
+        add_test(NAME ${test_name} COMMAND ${test_name}Tests)
+    endforeach()
+endif()

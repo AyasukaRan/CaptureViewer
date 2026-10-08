@@ -1,5 +1,6 @@
 #include "Application.hpp"
 #include "DeviceEnumeration.hpp"
+#include "VideoViewport.hpp"
 
 #ifndef MOD_NOREPEAT
 #define MOD_NOREPEAT 0x4000
@@ -200,19 +201,20 @@ int Application::run()
         directShowCapture_.start([this](const DirectShowCapture::Frame& frame) {
             handleFrame(frame);
         }, captureOptions);
+        captureStatus_.clear();
         logApp("[App] DirectShow capture started successfully");
     }
     catch (const std::exception& ex)
     {
-        running_ = false;
+        captureStatus_ = ex.what();
         logApp(std::string("[App] DirectShow capture start failed: ") + ex.what());
-        return EXIT_FAILURE;
+        showSettingsMenu();
     }
     catch (...)
     {
-        running_ = false;
+        captureStatus_ = "Could not start video capture.";
         logApp("[App] DirectShow capture start failed: unknown exception");
-        return EXIT_FAILURE;
+        showSettingsMenu();
     }
 
     applyAudioPlaybackSetting();
@@ -307,11 +309,16 @@ LRESULT CALLBACK Application::windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
-    if (msg == WM_KEYDOWN)
+    if (msg == WM_KEYDOWN && (lParam & (1LL << 30)) == 0)
     {
         if (wParam == VK_F11)
         {
             self->setFullscreen(!self->settings_.videoFullscreen);
+            return 0;
+        }
+        if (wParam == VK_F10)
+        {
+            self->setShowLatencyOverlay(!self->settings_.showLatencyOverlay);
             return 0;
         }
         if (wParam == 'M')
@@ -500,7 +507,7 @@ bool Application::createWindow(int width, int height)
     hwnd_ = CreateWindowExW(
         WS_EX_APPWINDOW,
         kWindowClassName,
-        L"Nintendo Switch 2",
+        L"CaptureViewer",
         style,
         windowX,
         windowY,
@@ -526,7 +533,7 @@ bool Application::createWindow(int width, int height)
         SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(classIconSmall));
     }
 
-    if (!SetWindowTextW(hwnd_, L"Nintendo Switch 2"))
+    if (!SetWindowTextW(hwnd_, L"CaptureViewer"))
     {
         logApp("[App] SetWindowTextW failed");
     }
@@ -574,12 +581,15 @@ void Application::destroyWindow()
 
 void Application::handleFrame(const DirectShowCapture::Frame& frame)
 {
-    std::scoped_lock lock(frameMutex_);
+    // The Sample Grabber invokes the handler synchronously. Serialize producers
+    // defensively, but never make a capture callback wait for rendering or a GPU.
+    std::scoped_lock captureLock(captureCopyMutex_);
 
     int backIndex = 1 - frontBufferIndex_;
     CpuFrame& dst = frames_[backIndex];
 
     dst.timestamp100ns = frame.timestamp100ns;
+    dst.receivedAt = frame.receivedAt;
 
     const std::uint32_t frameWidth = frame.width;
     const std::uint32_t frameHeight = frame.height;
@@ -675,8 +685,12 @@ void Application::handleFrame(const DirectShowCapture::Frame& frame)
         logPixel("bottom-right", dst.height - 1, dst.width - 1);
     }
 
-    frontBufferIndex_ = backIndex;
-    frameCounter_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::scoped_lock publishLock(frameMutex_);
+        dst.sequence = frameCounter_.load(std::memory_order_relaxed) + 1;
+        frontBufferIndex_ = backIndex;
+        frameCounter_.store(dst.sequence, std::memory_order_release);
+    }
     if (frameReadyEvent_)
     {
         SetEvent(frameReadyEvent_);
@@ -685,7 +699,8 @@ void Application::handleFrame(const DirectShowCapture::Frame& frame)
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
     {
-        logApp("[App] First frame received: " + std::to_string(dst.width) + "x" + std::to_string(dst.height) + " stride=" + std::to_string(dst.stride));
+        // dst can be swapped into the render thread after publication.
+        logApp("[App] First frame received: " + std::to_string(frameWidth) + "x" + std::to_string(frameHeight) + " stride=" + std::to_string(stride));
     }
 }
 
@@ -764,7 +779,9 @@ void Application::renderLoop()
                     HANDLE handles[] = {frameReadyEvent_};
                     MsgWaitForMultipleObjectsEx(1,
                                                 handles,
-                                                INFINITE,
+                                                (settings_.showLatencyOverlay ||
+                                                 frameCounter_.load(std::memory_order_acquire) > lastPresentedFrame_ ||
+                                                 forceRender_.load(std::memory_order_acquire)) ? 250 : INFINITE,
                                                 QS_ALLINPUT,
                                                 MWMO_INPUTAVAILABLE);
                 }
@@ -1068,6 +1085,39 @@ void Application::setVideoAspectMode(VideoAspectMode mode)
     requestImmediateRender();
 }
 
+void Application::setVideoScalePercent(unsigned int percent)
+{
+    percent = std::clamp(percent, 25u, 200u);
+    if (settings_.videoScalePercent == percent)
+    {
+        return;
+    }
+    settings_.videoScalePercent = percent;
+    savePersistentSettings();
+    requestImmediateRender();
+}
+
+void Application::setShowLatencyOverlay(bool enabled)
+{
+    settings_.showLatencyOverlay = enabled;
+    savePersistentSettings();
+    nextStatsRefresh_ = {};
+    requestImmediateRender();
+}
+
+void Application::setWindowMode(int mode)
+{
+    if (mode == 2)
+    {
+        setFullscreen(true);
+    }
+    else
+    {
+        setFullscreen(false);
+        setBorderlessWindowed(mode == 1);
+    }
+}
+
 void Application::setVideoFormatPreference(VideoFormatPreference preference)
 {
     if (settings_.videoFormatPreference == preference)
@@ -1189,32 +1239,61 @@ void Application::requestImmediateRender()
 
 bool Application::uploadLatestFrame()
 {
-    std::unique_lock<std::mutex> lock(frameMutex_, std::try_to_lock);
-    if (!lock.owns_lock())
+    // Resource creation may wait for a previous GPU frame. Prepare it from a
+    // descriptor first, then select the latest completed capture *after* waiting.
+    // Bound retries if a device keeps changing formats while we prepare it.
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
-        return false;
-    }
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t stride = 0;
+        auto format = DirectShowCapture::PixelFormat::BGRA8;
+        {
+            std::scoped_lock lock(frameMutex_);
+            const bool hasNewer = frameCounter_.load(std::memory_order_acquire) > lastSelectedFrame_;
+            const CpuFrame& candidate = hasNewer ? frames_[frontBufferIndex_] : renderCpuFrame_;
+            if (candidate.sequence <= lastPresentedFrame_ || candidate.data.empty() ||
+                candidate.width == 0 || candidate.height == 0)
+            {
+                return false;
+            }
+            width = candidate.width;
+            height = candidate.height;
+            stride = candidate.stride;
+            format = candidate.pixelFormat;
+        }
 
-    const std::uint64_t latest = frameCounter_.load(std::memory_order_acquire);
-    if (latest == lastPresentedFrame_)
-    {
-        return false;
-    }
+        if (!renderer_.prepareVideoResources(width, height, stride, toRendererFormat(format)))
+        {
+            return false;
+        }
 
-    const CpuFrame& src = frames_[frontBufferIndex_];
-    if (src.data.empty() || src.width == 0 || src.height == 0)
-    {
-        return false;
-    }
+        {
+            std::scoped_lock lock(frameMutex_);
+            if (frameCounter_.load(std::memory_order_acquire) > lastSelectedFrame_)
+            {
+                CpuFrame& newest = frames_[frontBufferIndex_];
+                if (newest.width != width || newest.height != height || newest.pixelFormat != format)
+                {
+                    continue;
+                }
+                std::swap(renderCpuFrame_, newest);
+                lastSelectedFrame_ = renderCpuFrame_.sequence;
+            }
+        }
 
-    renderer_.uploadFrame(src.data.data(),
-                          src.data.size(),
-                          src.stride,
-                          src.width,
-                          src.height,
-                          toRendererFormat(src.pixelFormat));
-    lastPresentedFrame_ = latest;
-    return true;
+        // renderCpuFrame_ belongs exclusively to this thread. The callback can
+        // keep overwriting the mailbox throughout upload and Present waits.
+        const CpuFrame& src = renderCpuFrame_;
+        if (!renderer_.uploadFrame(src.data.data(), src.data.size(), src.stride,
+                                   src.width, src.height, toRendererFormat(src.pixelFormat)))
+        {
+            return false;
+        }
+        uploadedFrameReceivedAt_ = src.receivedAt;
+        return true;
+    }
+    return false;
 }
 
 void Application::processPendingSourceDimensions()
@@ -1244,6 +1323,9 @@ bool Application::renderFrame(bool forcePresent)
 
     processPendingSourceDimensions();
 
+    frameRates_.update(std::chrono::steady_clock::now(),
+                       frameCounter_.load(std::memory_order_acquire), previewFrameCount_);
+
     const bool menuVisible = overlay_.isMenuVisible();
     renderer_.setBlurEnabled(menuVisible);
 
@@ -1252,6 +1334,40 @@ bool Application::renderFrame(bool forcePresent)
         overlay_.newFrame();
         overlay_.buildUI(*this);
         overlay_.endFrame();
+    }
+
+    const bool requested = forceRender_.exchange(false, std::memory_order_acq_rel);
+    const bool forced = forcePresent || requested;
+    const bool hasUnpresentedFrame = frameCounter_.load(std::memory_order_acquire) > lastPresentedFrame_;
+    const bool statsRefresh = settings_.showLatencyOverlay &&
+        std::chrono::steady_clock::now() >= nextStatsRefresh_;
+    // HUD draw data must not turn the capture-driven path into an unlimited render loop.
+    if (!hasUnpresentedFrame && !forced && !menuVisible && !statsRefresh)
+    {
+        return false;
+    }
+    if (!menuVisible && settings_.showLatencyOverlay)
+    {
+        overlay_.newFrame();
+        overlay_.buildUI(*this);
+        overlay_.endFrame();
+    }
+
+    // Reserve presentation/GPU capacity before choosing which captured frame
+    // to show. No capture mutex is held during this bounded wait.
+    if (!renderer_.prepareFrameForUpload())
+    {
+        if (forced)
+        {
+            forceRender_.store(true, std::memory_order_release);
+        }
+        return false;
+    }
+    const bool uploaded = uploadLatestFrame();
+    if (!uploaded && frameCounter_.load(std::memory_order_acquire) > lastPresentedFrame_)
+    {
+        // Retry the newest frame later rather than presenting an older snapshot.
+        return false;
     }
 
     if (hwnd_)
@@ -1277,20 +1393,24 @@ bool Application::renderFrame(bool forcePresent)
         }
     }
 
-    const bool uploaded = uploadLatestFrame();
-    const bool forced = forcePresent || forceRender_.exchange(false, std::memory_order_acq_rel);
-    const bool overlayHasDraw = overlay_.hasDrawData();
-    const bool hasFrame = (lastPresentedFrame_ != 0);
-
-    if (uploaded || forced || overlayHasDraw || (forcePresent && hasFrame))
+    const bool presented = renderer_.render([&](ID3D12GraphicsCommandList* cmdList) {
+        overlay_.render(cmdList);
+    });
+    if (presented && uploaded)
     {
-        renderer_.render([&](ID3D12GraphicsCommandList* cmdList) {
-            overlay_.render(cmdList);
-        });
-        return true;
+        // Only successful, unique captured frames contribute to preview FPS and
+        // timing. Failed presents retain the CPU frame for retry or replacement.
+        skippedFrameCount_ += renderCpuFrame_.sequence - lastPresentedFrame_ - 1;
+        lastPresentedFrame_ = renderCpuFrame_.sequence;
+        ++previewFrameCount_;
+        frameTiming_.record(uploadedFrameReceivedAt_, renderer_.lastPresentReturnTime());
     }
-
-    return false;
+    else if (!presented && forced)
+    {
+        forceRender_.store(true, std::memory_order_release);
+    }
+    nextStatsRefresh_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    return presented;
 }
 
 std::string Application::toLowerCopy(const std::string& text)
@@ -1530,98 +1650,13 @@ bool Application::applyLockedWindowSize(MINMAXINFO* info) const
 
 RECT Application::computeVideoViewport(const RECT& clientRect, bool& valid) const
 {
-    valid = false;
-    RECT viewport{0, 0, 0, 0};
-
-    const LONG clientWidth = clientRect.right - clientRect.left;
-    const LONG clientHeight = clientRect.bottom - clientRect.top;
-    if (clientWidth <= 0 || clientHeight <= 0)
-    {
-        return viewport;
-    }
-
-    const std::uint32_t srcWidth = currentSourceWidth_.load(std::memory_order_acquire);
-    const std::uint32_t srcHeight = currentSourceHeight_.load(std::memory_order_acquire);
-    if (srcWidth == 0 || srcHeight == 0)
-    {
-        return viewport;
-    }
-
-    switch (settings_.videoAspectMode)
-    {
-    case VideoAspectMode::Stretch:
-        viewport.left = 0;
-        viewport.top = 0;
-        viewport.right = clientWidth;
-        viewport.bottom = clientHeight;
-        valid = true;
-        return viewport;
-
-    case VideoAspectMode::Maintain:
-    {
-        const double srcAspect = static_cast<double>(srcWidth) / static_cast<double>(srcHeight);
-        const double clientAspect = static_cast<double>(clientWidth) / static_cast<double>(clientHeight);
-        constexpr double epsilon = 1e-4;
-
-        int viewportWidth = static_cast<int>(clientWidth);
-        int viewportHeight = static_cast<int>(clientHeight);
-        if (std::abs(clientAspect - srcAspect) > epsilon)
-        {
-            if (clientAspect > srcAspect)
-            {
-                viewportHeight = static_cast<int>(clientHeight);
-                viewportWidth = static_cast<int>(std::round(static_cast<double>(viewportHeight) * srcAspect));
-            }
-            else
-            {
-                viewportWidth = static_cast<int>(clientWidth);
-                viewportHeight = static_cast<int>(std::round(static_cast<double>(viewportWidth) / srcAspect));
-            }
-        }
-
-        viewportWidth = std::max(1, std::min(viewportWidth, static_cast<int>(clientWidth)));
-        viewportHeight = std::max(1, std::min(viewportHeight, static_cast<int>(clientHeight)));
-
-        const int offsetX = (static_cast<int>(clientWidth) - viewportWidth) / 2;
-        const int offsetY = (static_cast<int>(clientHeight) - viewportHeight) / 2;
-
-        viewport.left = offsetX;
-        viewport.top = offsetY;
-        viewport.right = offsetX + viewportWidth;
-        viewport.bottom = offsetY + viewportHeight;
-        valid = true;
-        return viewport;
-    }
-
-    case VideoAspectMode::Capture:
-    {
-        double scale = std::min<double>(static_cast<double>(clientWidth) / static_cast<double>(srcWidth),
-                                        static_cast<double>(clientHeight) / static_cast<double>(srcHeight));
-        if (scale <= 0.0)
-        {
-            scale = 1.0;
-        }
-        if (scale > 1.0)
-        {
-            scale = 1.0; // never upscale beyond native resolution
-        }
-
-        int viewportWidth = static_cast<int>(std::round(static_cast<double>(srcWidth) * scale));
-        int viewportHeight = static_cast<int>(std::round(static_cast<double>(srcHeight) * scale));
-        viewportWidth = std::max(1, std::min(viewportWidth, static_cast<int>(clientWidth)));
-        viewportHeight = std::max(1, std::min(viewportHeight, static_cast<int>(clientHeight)));
-        const int offsetX = (static_cast<int>(clientWidth) - viewportWidth) / 2;
-        const int offsetY = (static_cast<int>(clientHeight) - viewportHeight) / 2;
-        viewport.left = offsetX;
-        viewport.top = offsetY;
-        viewport.right = offsetX + viewportWidth;
-        viewport.bottom = offsetY + viewportHeight;
-        valid = true;
-        return viewport;
-    }
-    }
-
-    return viewport;
+    const auto viewport = computeVideoViewportDimensions(
+        clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
+        static_cast<int>(currentSourceWidth_.load(std::memory_order_acquire)),
+        static_cast<int>(currentSourceHeight_.load(std::memory_order_acquire)),
+        settings_.videoAspectMode, settings_.videoScalePercent);
+    valid = viewport.width > 0 && viewport.height > 0;
+    return RECT{viewport.x, viewport.y, viewport.x + viewport.width, viewport.y + viewport.height};
 }
 
 bool Application::shouldUseVideoAudio() const
@@ -1672,9 +1707,18 @@ void Application::restartVideoCapture()
         std::lock_guard<std::mutex> lock(frameMutex_);
         frames_[0] = CpuFrame{};
         frames_[1] = CpuFrame{};
+        frontBufferIndex_ = 0;
     }
+    renderCpuFrame_ = CpuFrame{};
     frameCounter_.store(0, std::memory_order_release);
+    lastSelectedFrame_ = 0;
     lastPresentedFrame_ = 0;
+    uploadedFrameReceivedAt_ = {};
+    frameTiming_.reset();
+    frameRates_.reset();
+    previewFrameCount_ = 0;
+    skippedFrameCount_ = 0;
+    nextStatsRefresh_ = {};
 
     try
     {
@@ -1688,14 +1732,17 @@ void Application::restartVideoCapture()
         directShowCapture_.start([this](const DirectShowCapture::Frame& frame) {
             handleFrame(frame);
         }, options);
+        captureStatus_.clear();
         logApp("[App] Video capture restarted successfully");
     }
     catch (const std::exception& ex)
     {
+        captureStatus_ = ex.what();
         logApp(std::string("[App] Failed to restart capture: ") + ex.what());
     }
     catch (...)
     {
+        captureStatus_ = "Could not start video capture.";
         logApp("[App] Failed to restart capture: unknown error");
     }
 }

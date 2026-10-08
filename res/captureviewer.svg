@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>CaptureViewer</title>
+  <desc>A cyan display with a white preview play symbol on a dark rounded square.</desc>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#101827"/>
+  <rect x="35" y="48" width="186" height="133" rx="19" fill="#122b3b" stroke="#36d9ee" stroke-width="12"/>
+  <path d="M111 83L163 114.5L111 146Z" fill="#f4fbff" stroke="#f4fbff" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M128 184V207M92 207H164" fill="none" stroke="#36d9ee" stroke-width="14" stroke-linecap="round"/>
+</svg>

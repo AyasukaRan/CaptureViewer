@@ -28,6 +28,25 @@ jobs:
       - name: Build Release
         run: cmake --build build --config Release --parallel
 
+      - name: Test frame timing, frame rates and viewport scaling
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke test Windows UI without capture hardware
+        run: ./tests/UiSmoke.ps1 -Executable build/Release/viewer.exe
+
+      - name: Upload UI verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows-UI-verification
+          path: |
+            build/ui-smoke/*.png
+            build/ui-smoke/*.txt
+            build/ui-smoke/*.log
+            build/ui-smoke/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Verify executable and prepare portable package
         run: |
           $ErrorActionPreference = 'Stop'
@@ -50,7 +69,7 @@ jobs:
             "Build: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
             'Target: Windows x64 Release, static MSVC runtime'
             'Built on: GitHub-hosted windows-2022 with Visual Studio 2022'
-            'Validation: x64 PE headers; capture hardware testing is required separately'
+            'Validation: unit tests, Windows UI smoke test and x64 PE headers; capture hardware testing is required separately'
           ) | Set-Content "$package/BUILD-INFO.txt" -Encoding utf8
           $hash = (Get-FileHash "$package/viewer.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  viewer.exe" | Set-Content "$package/SHA256SUMS.txt" -Encoding ascii

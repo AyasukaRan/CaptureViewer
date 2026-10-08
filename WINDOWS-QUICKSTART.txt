@@ -3,9 +3,23 @@ CaptureViewer - Windows x64 portable build
 1. Extract the complete downloaded ZIP into a writable folder on Windows 11 x64.
 2. Connect your HDMI capture device and install its drivers if required.
 3. Run viewer.exe. A Direct3D 12 capable GPU is required.
-4. Press M to open settings and choose the video and audio capture devices.
-5. Select a resolution, frame rate and pixel format supported by your device.
-6. Press F11 to toggle fullscreen. V-sync and window options are in settings.
+4. Press M to open the ImGui settings menu:
+   Display: windowed/borderless/fullscreen, VSync, HUD and preview scaling.
+   Capture: device, resolution, frame rate and pixel format.
+   Audio: input, monitoring and output devices.
+5. Press F11 to toggle fullscreen; F10 toggles the top latency/FPS overlay.
+6. Choose Fit, Stretch, Native, Fill/crop, or Custom 25-200% source scaling.
+   Custom 100% maps one source pixel to one display pixel. It does not change
+   the capture resolution. Close the menu for high-frame-rate playback.
+
+The preview keeps the latest received frame and skips older frames rather than
+playing a delayed queue. VSync defaults off unless an existing settings file
+enables it. Skipped counts old frames bypassed by the application.
+
+APP LATENCY measures the local capture callback through the return of Present.
+It excludes capture-card/USB latency and actual GPU scanout/screen latency.
+CAPTURE FPS is received video frames; PREVIEW FPS counts newly submitted frames,
+not repeated overlay redraws. FPS readings update about twice per second.
 
 The application saves settings.json beside viewer.exe. Fonts, icons and shaders
 are embedded. This build statically links the MSVC C++ runtime.

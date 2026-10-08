@@ -8,6 +8,8 @@
 #include "AudioPlayback.hpp"
 #include "OverlayUI.hpp"
 #include "DeviceEnumeration.hpp"
+#include "FrameTimingStats.hpp"
+#include "FrameRateStats.hpp"
 
 #include <Windows.h>
 #include <atomic>
@@ -29,6 +31,8 @@ private:
         std::uint32_t height = 0;
         std::uint32_t stride = 0;
         std::uint64_t timestamp100ns = 0;
+        std::uint64_t sequence = 0;
+        std::chrono::steady_clock::time_point receivedAt{};
         DirectShowCapture::PixelFormat pixelFormat = DirectShowCapture::PixelFormat::BGRA8;
         std::vector<std::uint8_t> data;
     };
@@ -63,6 +67,9 @@ private:
     void setVideoFrameRate100(std::uint32_t frameRate100);
     void setVideoAllowResizing(bool enabled);
     void setVideoAspectMode(VideoAspectMode mode);
+    void setVideoScalePercent(unsigned int percent);
+    void setShowLatencyOverlay(bool enabled);
+    void setWindowMode(int mode);
     void setVideoFormatPreference(VideoFormatPreference preference);
     void setVSyncEnabled(bool enabled);
     void setBorderlessWindowed(bool enabled);
@@ -82,14 +89,19 @@ private:
     D3DRenderer renderer_;
     DirectShowCapture directShowCapture_;
 
+    // Capture copies never hold frameMutex_; only publication and buffer swaps do.
+    std::mutex captureCopyMutex_;
     std::mutex frameMutex_;
     CpuFrame frames_[2];
+    CpuFrame renderCpuFrame_;
     std::atomic<std::uint64_t> frameCounter_{0};
+    std::uint64_t lastSelectedFrame_ = 0;
     std::uint64_t lastPresentedFrame_ = 0;
     int frontBufferIndex_ = 0;
     bool running_ = false;
     bool classRegistered_ = false;
     bool audioEnabled_ = false;
+    std::string captureStatus_;
 
     AudioPlayback audioPlayback_;
     OverlayUI overlay_;
@@ -111,5 +123,11 @@ private:
     bool restoreWindowPlacementAfterFullscreen_ = false;
     std::atomic<bool> forceRender_{false};
     std::chrono::steady_clock::time_point overlayNextFrameDeadline_;
+    std::chrono::steady_clock::time_point nextStatsRefresh_{};
+    std::chrono::steady_clock::time_point uploadedFrameReceivedAt_{};
+    FrameTimingStats frameTiming_;
+    FrameRateStats frameRates_;
+    std::uint64_t previewFrameCount_ = 0;
+    std::uint64_t skippedFrameCount_ = 0;
     HANDLE frameReadyEvent_ = nullptr;
 };

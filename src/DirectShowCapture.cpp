@@ -1037,6 +1037,7 @@ struct DirectShowCaptureImpl
 
     HRESULT processBuffer(double sampleTime, const BYTE* buffer, long bufferLen)
     {
+        const auto receivedAt = std::chrono::steady_clock::now();
         if (!running.load(std::memory_order_acquire) || !handler)
         {
             return S_OK;
@@ -1048,6 +1049,7 @@ struct DirectShowCaptureImpl
         }
 
         DirectShowCapture::Frame frame{};
+        frame.receivedAt = receivedAt;
         frame.sampleWidth = frameWidth;
         frame.sampleHeight = frameHeight;
         frame.contentLeft = contentLeft;

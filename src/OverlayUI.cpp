@@ -223,12 +223,18 @@ void OverlayUI::newFrame()
 
 void OverlayUI::buildUI(Application& app)
 {
-    if (!initialized_ || !menuVisible_)
+    if (!initialized_)
     {
         return;
     }
-
-    drawMenuWindow(app);
+    if (app.settings().showLatencyOverlay)
+    {
+        drawPerformanceOverlay(app);
+    }
+    if (menuVisible_)
+    {
+        drawMenuWindow(app);
+    }
 }
 
 void OverlayUI::endFrame()
@@ -349,13 +355,60 @@ void OverlayUI::refreshVideoFormats(Application& app)
     videoFormats_ = enumerateVideoFormats(moniker);
 }
 
+void OverlayUI::drawPerformanceOverlay(Application& app)
+{
+    const auto& timing = app.frameTiming_;
+    const auto& rates = app.frameRates_;
+    const auto now = std::chrono::steady_clock::now();
+    const bool stale = timing.hasSamples() &&
+        now - timing.lastReceivedAt() > std::chrono::seconds(1);
+    ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(std::max(1.0f, ImGui::GetIO().DisplaySize.x - 24.0f), 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.78f);
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    if (ImGui::Begin("Performance overlay", nullptr, flags))
+    {
+        if (rates.hasSample())
+        {
+            ImGui::TextWrapped("CAPTURE  %.1f FPS    PREVIEW  %.1f FPS    SKIPPED  %llu",
+                               rates.captureFps(), rates.previewFps(),
+                               static_cast<unsigned long long>(app.skippedFrameCount_));
+        }
+        else
+        {
+            ImGui::TextWrapped("CAPTURE  -- FPS    PREVIEW  -- FPS    SKIPPED  %llu",
+                               static_cast<unsigned long long>(app.skippedFrameCount_));
+        }
+        if (timing.hasSamples() && !stale)
+        {
+            ImGui::TextWrapped("APP LATENCY  %.2f ms    Average  %.2f ms    Peak  %.2f ms",
+                               timing.latestMs(), timing.averageMs(), timing.maximumMs());
+        }
+        else
+        {
+            ImGui::TextUnformatted(stale ? "APP LATENCY  --  No recent preview frames" :
+                                                   "APP LATENCY  --  Waiting for video frames");
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("App latency only; excludes hardware/screen delay.    M: Settings    F10: Overlay    F11: Fullscreen");
+        ImGui::PopStyleColor();
+        performanceOverlayHeight_ = ImGui::GetWindowHeight();
+    }
+    ImGui::End();
+}
+
 void OverlayUI::drawMenuWindow(Application& app)
 {
     ImGuiIO& io = ImGui::GetIO();
 
-    const float panelWidth = 480.0f;
-	const float panelHeight = 0.0f;
-    ImVec2 panelPos((io.DisplaySize.x - panelWidth) * 0.5f, std::clamp(io.DisplaySize.y - 900.0f, 0.0f, io.DisplaySize.y) * 0.5f);
+    const float panelWidth = std::max(1.0f, std::min(600.0f, io.DisplaySize.x - 24.0f));
+    const float panelTop = app.settings().showLatencyOverlay ? performanceOverlayHeight_ + 24.0f : 12.0f;
+    const float panelHeight = std::max(1.0f, std::min(760.0f, io.DisplaySize.y - panelTop - 12.0f));
+    ImVec2 panelPos((io.DisplaySize.x - panelWidth) * 0.5f,
+                   std::max(panelTop, (io.DisplaySize.y - panelHeight) * 0.5f));
     ImGui::SetNextWindowPos(panelPos, ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight));
 
@@ -370,75 +423,105 @@ void OverlayUI::drawMenuWindow(Application& app)
         return;
     }
 
-    ImGui::TextUnformatted("Video Settings");
-    ImGui::Separator();
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, 5.0f));
-    bool allowResizing = app.settings().videoAllowResizing;
-    if (ImGui::Toggle("Allow Resizing", &allowResizing, ImGuiToggleFlags_Animated))
+    ImGui::TextDisabled("M / Esc: Close    F11: Fullscreen    F10: Performance overlay");
+    if (ImGui::BeginTabBar("SettingsTabs"))
     {
-        app.setVideoAllowResizing(allowResizing);
-    }
-
-    bool fullscreen = app.settings().videoFullscreen;
-    bool borderlessWindowed = app.settings().videoBorderlessWindowed;
-    if (fullscreen)
+    if (ImGui::BeginTabItem("Display"))
     {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Toggle("Borderless Windowed", &borderlessWindowed, ImGuiToggleFlags_Animated))
-    {
-        app.setBorderlessWindowed(borderlessWindowed);
-    }
-    if (fullscreen)
-    {
+        ImGui::Spacing();
+        const char* windowModes[] = {"Windowed", "Borderless window", "Fullscreen (borderless)"};
+        int windowMode = app.settings().videoFullscreen ? 2 : (app.settings().videoBorderlessWindowed ? 1 : 0);
+        ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x * 0.55f));
+        if (ImGui::Combo("Window mode", &windowMode, windowModes, IM_ARRAYSIZE(windowModes)))
+        {
+            app.setWindowMode(windowMode);
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, 5.0f));
+        bool allowResizing = app.settings().videoAllowResizing;
+        if (ImGui::Toggle("Allow window resizing", &allowResizing, ImGuiToggleFlags_Animated))
+        {
+            app.setVideoAllowResizing(allowResizing);
+        }
+        bool vsyncEnabled = app.settings().vsyncEnabled;
+        if (ImGui::Toggle("VSync", &vsyncEnabled, ImGuiToggleFlags_Animated))
+        {
+            app.setVSyncEnabled(vsyncEnabled);
+        }
+        bool showOverlay = app.settings().showLatencyOverlay;
+        if (ImGui::Toggle("Latency and FPS overlay", &showOverlay, ImGuiToggleFlags_Animated))
+        {
+            app.setShowLatencyOverlay(showOverlay);
+        }
+        ImGui::PopStyleVar();
+        ImGui::TextWrapped("Frame policy: Latest frame only. Older frames are discarded when preview falls behind. VSync is off by default to reduce waiting; enabling it avoids tearing.");
+        ImGui::Spacing();
+        ImGui::SeparatorText("Resolution scaling");
+        const char* scalingModes[] = {"Stretch to window", "Fit (keep aspect ratio)", "Native (downscale only)",
+                                      "Fill (crop edges)", "Custom source scale"};
+        int scaling = static_cast<int>(app.settings().videoAspectMode);
+        ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x * 0.55f));
+        if (ImGui::Combo("Scaling mode", &scaling, scalingModes, IM_ARRAYSIZE(scalingModes)))
+        {
+            app.setVideoAspectMode(static_cast<VideoAspectMode>(std::clamp(scaling, 0, 4)));
+        }
+        if (app.settings().videoAspectMode == VideoAspectMode::Custom)
+        {
+            int percent = static_cast<int>(app.settings().videoScalePercent);
+            ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x * 0.55f));
+            if (ImGui::SliderInt("Source scale", &percent, 25, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp))
+            {
+                app.setVideoScalePercent(static_cast<unsigned int>(percent));
+            }
+            if (ImGui::BeginTable("ScalePresets", 3, ImGuiTableFlags_SizingStretchSame))
+            {
+                for (const unsigned int preset : {50u, 75u, 100u, 125u, 150u, 200u})
+                {
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(static_cast<int>(preset));
+                    const std::string label = std::to_string(preset) + "%";
+                    if (ImGui::Button(label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+                    {
+                        app.setVideoScalePercent(preset);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+        }
+        ImGui::TextWrapped("Scaling changes the preview only. Choose the capture resolution and frame rate in the Capture tab. Custom 100%% means one source pixel per display pixel; larger images are cropped at the window edges.");
+        RECT client{};
+        if (GetClientRect(app.hwnd(), &client))
+        {
+            bool valid = false;
+            const RECT viewport = app.computeVideoViewport(client, valid);
+            if (valid)
+            {
+                ImGui::TextDisabled("Source %ux%u  ->  Preview %ldx%ld  |  Window %ldx%ld",
+                    app.currentCaptureWidth(), app.currentCaptureHeight(),
+                    viewport.right - viewport.left, viewport.bottom - viewport.top,
+                    client.right - client.left, client.bottom - client.top);
+            }
+        }
+        ImGui::BeginDisabled(app.settings().videoFullscreen);
+        if (ImGui::Button("Recenter window")) { app.recenterWindow(); }
         ImGui::EndDisabled();
+        ImGui::Spacing();
+        ImGui::SeparatorText("Performance readings");
+        ImGui::TextWrapped("App latency measures receipt of a video frame through the return of its Present call. Average and peak cover up to 120 completed video frames. It is not HDMI-to-screen latency.");
+        ImGui::TextWrapped("Capture FPS counts video callbacks; Preview FPS counts new video frames successfully submitted for presentation. The overlay refreshes idle status at most four times per second, and FPS updates every half second. GPU scanout is not measured.");
+        ImGui::EndTabItem();
     }
-
-    if (ImGui::Toggle("Fullscreen", &fullscreen, ImGuiToggleFlags_Animated))
+    if (ImGui::BeginTabItem("Capture"))
     {
-        app.setFullscreen(fullscreen);
-    }
-
-    bool vsyncEnabled = app.settings().vsyncEnabled;
-    if (ImGui::Toggle("VSync", &vsyncEnabled, ImGuiToggleFlags_Animated))
-    {
-        app.setVSyncEnabled(vsyncEnabled);
-    }
-    ImGui::PopStyleVar();
-
-    static const char* aspectOptions[] = {"Stretch", "Force Aspect Ratio", "Force Capture Resolution"};
-    int currentAspect = static_cast<int>(app.settings().videoAspectMode);
-    ImGui::SetNextItemWidth(ImGui::GetWindowWidth() * 0.5f);
-    if (ImGui::Combo("Aspect Mode", &currentAspect, aspectOptions, IM_ARRAYSIZE(aspectOptions)))
-    {
-        currentAspect = std::clamp(currentAspect, 0, 2);
-        app.setVideoAspectMode(static_cast<VideoAspectMode>(currentAspect));
-    }
-
     ImGui::Spacing();
-
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(35.0f / 255.0f, 137.0f / 255.0f, 177.0f / 255.0f, 1.0f));
-    if (fullscreen)
+    if (ImGui::Button("Refresh devices and modes")) { refreshDeviceLists(app); }
+    if (!app.captureStatus_.empty())
     {
-        ImGui::BeginDisabled();
+        ImGui::TextWrapped("Capture unavailable: %s", app.captureStatus_.c_str());
+        ImGui::TextWrapped("Connect a device, refresh the list, then select a capture source.");
+        if (ImGui::Button("Retry capture")) { app.restartVideoCapture(); }
     }
-    if (ImGui::Button("Recenter Window"))
-    {
-        app.recenterWindow();
-    }
-    if (fullscreen)
-    {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh Devices"))
-    {
-        refreshDeviceLists(app);
-    }
-	ImGui::PopStyleColor();
-
     ImGui::Spacing();
-
     ImGui::TextUnformatted("Video Capture Devices");
     ImGui::BeginChild("VideoDevices", ImVec2(0.0f, 80), ImGuiChildFlags_Borders);
     const std::string& currentVideo = app.settings().videoDeviceMoniker;
@@ -666,6 +749,11 @@ void OverlayUI::drawMenuWindow(Application& app)
     }
 
     ImGui::Spacing();
+    ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Audio"))
+    {
+    if (ImGui::Button("Refresh audio devices")) { refreshDeviceLists(app); }
     ImGui::TextUnformatted("Audio Settings");
     ImGui::Separator();
 
@@ -755,8 +843,10 @@ void OverlayUI::drawMenuWindow(Application& app)
 
     ImGui::Spacing();
 
-	ImGui::SetCursorPosX(ImGui::GetWindowWidth() - ImGui::CalcTextSize("v1.0.5  ").x);
-	ImGui::TextDisabled("v1.0.5");
+    ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+    }
 
     if (ImGui::IsKeyReleased(ImGuiKey_Escape))
     {

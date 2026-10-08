@@ -38,11 +38,13 @@ private:
     void refreshVideoModes(Application& app);
     void refreshVideoFormats(Application& app);
     void drawMenuWindow(Application& app);
+    void drawPerformanceOverlay(Application& app);
 
     HWND hwnd_ = nullptr;
     bool initialized_ = false;
     bool menuVisible_ = false;
     bool drawDataValid_ = false;
+    float performanceOverlayHeight_ = 84.0f;
 
     D3DRenderer* renderer_ = nullptr;
     ID3D12DescriptorHeap* srvHeap_ = nullptr;

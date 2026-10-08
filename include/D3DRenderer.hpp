@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 
 #include <d3d12.h>
@@ -25,14 +26,20 @@ public:
 
     void onResize(UINT width, UINT height);
 
-    void uploadFrame(const void* data,
+    // Wait before selecting the newest CPU frame, not after holding a snapshot.
+    bool prepareFrameForUpload();
+    bool prepareVideoResources(std::uint32_t width, std::uint32_t height,
+                               std::uint32_t stride, FrameFormat format);
+
+    bool uploadFrame(const void* data,
                      std::size_t dataSize,
                      std::uint32_t stride,
                      std::uint32_t width,
                      std::uint32_t height,
                      FrameFormat format);
 
-    void render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback = nullptr);
+    bool render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback = nullptr);
+    [[nodiscard]] std::chrono::steady_clock::time_point lastPresentReturnTime() const { return lastPresentReturnTime_; }
 
     void setVSyncEnabled(bool enable) { vsyncEnabled_ = enable; }
     [[nodiscard]] bool vsyncEnabled() const { return vsyncEnabled_; }
@@ -69,7 +76,7 @@ private:
                               std::uint32_t stride,
                               FrameFormat format);
     void destroyFrameResources();
-    void waitForFrame(FrameContext& frameContext);
+    bool waitForFrame(FrameContext& frameContext, DWORD timeoutMs = INFINITE);
     void waitForGpu();
 
     static constexpr std::uint32_t kFrameCount = 2;
@@ -144,6 +151,8 @@ private:
     bool loggedGpuPixels_ = false;
     bool debugLayerEnabled_ = false;
     bool blurEnabled_ = false;
+    bool presentationSlotReady_ = false;
+    std::chrono::steady_clock::time_point lastPresentReturnTime_{};
 
     void updateViewport(UINT width, UINT height);
 };

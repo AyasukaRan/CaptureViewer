@@ -432,6 +432,7 @@ void D3DRenderer::shutdown()
     fenceValue_ = 1;
     allowTearing_ = false;
     loggedGpuPixels_ = false;
+    presentationSlotReady_ = false;
 }
 
 void D3DRenderer::onResize(UINT width, UINT height)
@@ -442,6 +443,7 @@ void D3DRenderer::onResize(UINT width, UINT height)
     }
 
     waitForGpu();
+    presentationSlotReady_ = false;
     destroyRenderTarget();
 
     UINT flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -470,12 +472,38 @@ void D3DRenderer::onResize(UINT width, UINT height)
     updateViewport(backBufferWidth_, backBufferHeight_);
 }
 
+bool D3DRenderer::prepareFrameForUpload()
+{
+    if (!swapChain_ || !commandQueue_ || !commandList_)
+    {
+        return false;
+    }
+    if (!presentationSlotReady_)
+    {
+        if (frameLatencyWaitableObject_ &&
+            WaitForSingleObject(frameLatencyWaitableObject_, 100) != WAIT_OBJECT_0)
+        {
+            return false;
+        }
+        // Retain the reservation when a later fence wait or command reset fails.
+        // A second wait before any Present could otherwise consume no new signal.
+        presentationSlotReady_ = true;
+    }
+    return waitForFrame(frameContexts_[swapChain_->GetCurrentBackBufferIndex()], 100);
+}
+
+bool D3DRenderer::prepareVideoResources(std::uint32_t width, std::uint32_t height,
+                                       std::uint32_t stride, FrameFormat format)
+{
+    return ensureFrameResources(width, height, stride, format);
+}
+
 bool D3DRenderer::ensureFrameResources(std::uint32_t width,
                                        std::uint32_t height,
                                        std::uint32_t stride,
                                        FrameFormat format)
 {
-    if (!device_ || width == 0 || height == 0)
+    if (!device_ || width == 0 || height == 0 || width > 16384 || height > 16384)
     {
         return false;
     }
@@ -495,7 +523,15 @@ bool D3DRenderer::ensureFrameResources(std::uint32_t width,
 
     if (needsRecreate)
     {
-        waitForGpu();
+        // All submitted work is covered by these fences. Resource preparation
+        // runs before taking the latest CPU snapshot and never blocks capture.
+        for (auto& context : frameContexts_)
+        {
+            if (!waitForFrame(context, 100))
+            {
+                return false;
+            }
+        }
         destroyFrameResources();
 
         D3D12_RESOURCE_DESC desc{};
@@ -653,7 +689,7 @@ void D3DRenderer::destroyFrameResources()
     frameFormat_ = FrameFormat::BGRA8;
 }
 
-void D3DRenderer::uploadFrame(const void* data,
+bool D3DRenderer::uploadFrame(const void* data,
                               std::size_t dataSize,
                               std::uint32_t stride,
                               std::uint32_t width,
@@ -662,14 +698,17 @@ void D3DRenderer::uploadFrame(const void* data,
 {
     if (!device_ || !data || width == 0 || height == 0)
     {
-        return;
+        return false;
     }
 
     const std::uint32_t defaultStride = (format == FrameFormat::NV12) ? width : width * 4u;
     const std::uint32_t effectiveStride = stride != 0 ? stride : defaultStride;
-    if (!ensureFrameResources(width, height, effectiveStride, format))
+    // Resources and the backbuffer fence must already be ready before the
+    // caller selects its latest frame. Never wait/recreate after that snapshot.
+    if (!presentationSlotReady_ || !frameTexture_ || frameWidth_ != width ||
+        frameHeight_ != height || frameFormat_ != format)
     {
-        return;
+        return false;
     }
 
     UINT uploadIndex = 0;
@@ -679,12 +718,15 @@ void D3DRenderer::uploadFrame(const void* data,
         uploadIndex %= kFrameCount;
     }
 
-    waitForFrame(frameContexts_[uploadIndex]);
+    if (!waitForFrame(frameContexts_[uploadIndex], 0))
+    {
+        return false;
+    }
 
     UploadResource& upload = frameUploads_[uploadIndex];
     if (!upload.cpuAddress || upload.subresourceCount == 0)
     {
-        return;
+        return false;
     }
 
     const auto* sourceBytes = static_cast<const std::uint8_t*>(data);
@@ -743,36 +785,40 @@ void D3DRenderer::uploadFrame(const void* data,
 
     if (!copied)
     {
-        return;
+        return false;
     }
 
     pendingUpload_[uploadIndex] = true;
     loggedGpuPixels_ = false;
+    return true;
 }
 
-void D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback)
+bool D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback)
 {
-    if (!swapChain_ || !commandQueue_ || !commandList_)
+    if (!swapChain_ || !commandQueue_ || !commandList_ || !presentationSlotReady_)
     {
-        return;
+        return false;
     }
 
     const UINT backBufferIndex = swapChain_->GetCurrentBackBufferIndex();
     FrameContext& frameContext = frameContexts_[backBufferIndex];
-    waitForFrame(frameContext);
+    if (!waitForFrame(frameContext, 0))
+    {
+        return false;
+    }
 
     HRESULT hr = frameContext.commandAllocator->Reset();
     if (FAILED(hr))
     {
         logFailure("CommandAllocator::Reset", hr);
-        return;
+        return false;
     }
 
     hr = commandList_->Reset(frameContext.commandAllocator.Get(), nullptr);
     if (FAILED(hr))
     {
         logFailure("CommandList::Reset", hr);
-        return;
+        return false;
     }
 
     UploadResource& upload = frameUploads_[backBufferIndex];
@@ -810,8 +856,6 @@ void D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& 
         toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         commandList_->ResourceBarrier(1, &toShader);
-
-        pendingUpload_[backBufferIndex] = false;
 
 #if PCKVM_RENDERER_LOGGING
         if (!loggedGpuPixels_ && upload.cpuAddress)
@@ -852,7 +896,7 @@ void D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& 
     if (!backBuffer)
     {
         commandList_->Close();
-        return;
+        return false;
     }
 
     D3D12_RESOURCE_BARRIER toRenderTarget{};
@@ -871,35 +915,40 @@ void D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& 
     commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     commandList_->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
-    commandList_->SetGraphicsRootSignature(rootSignature_.Get());
-    ID3D12PipelineState* activePso = (frameFormat_ == FrameFormat::NV12 && pipelineStateNv12_)
-        ? pipelineStateNv12_.Get()
-        : pipelineState_.Get();
-    if (blurEnabled_)
-    {
-        if (frameFormat_ == FrameFormat::NV12 && pipelineStateNv12Blur_)
-        {
-            activePso = pipelineStateNv12Blur_.Get();
-        }
-        else if (pipelineStateBlur_)
-        {
-            activePso = pipelineStateBlur_.Get();
-        }
-    }
-    commandList_->SetPipelineState(activePso);
-
     ID3D12DescriptorHeap* heaps[] = {srvHeap_.Get(), samplerHeap_.Get()};
-    commandList_->SetDescriptorHeaps(static_cast<UINT>(std::size(heaps)), heaps);
-    commandList_->SetGraphicsRootDescriptorTable(0, srvHandleFrameGpu_);
-    commandList_->SetGraphicsRootDescriptorTable(1, samplerHandleGpu_);
+    // A missing capture device still has a usable settings UI. Never sample
+    // the uninitialized video descriptor before the first uploaded frame.
+    if (frameTexture_)
+    {
+        commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+        ID3D12PipelineState* activePso = (frameFormat_ == FrameFormat::NV12 && pipelineStateNv12_)
+            ? pipelineStateNv12_.Get()
+            : pipelineState_.Get();
+        if (blurEnabled_)
+        {
+            if (frameFormat_ == FrameFormat::NV12 && pipelineStateNv12Blur_)
+            {
+                activePso = pipelineStateNv12Blur_.Get();
+            }
+            else if (pipelineStateBlur_)
+            {
+                activePso = pipelineStateBlur_.Get();
+            }
+        }
+        commandList_->SetPipelineState(activePso);
 
-    commandList_->RSSetViewports(1, &viewport_);
-    commandList_->RSSetScissorRects(1, &scissorRect_);
+        commandList_->SetDescriptorHeaps(static_cast<UINT>(std::size(heaps)), heaps);
+        commandList_->SetGraphicsRootDescriptorTable(0, srvHandleFrameGpu_);
+        commandList_->SetGraphicsRootDescriptorTable(1, samplerHandleGpu_);
 
-    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
-    commandList_->IASetIndexBuffer(&indexBufferView_);
-    commandList_->DrawIndexedInstanced(static_cast<UINT>(kIndices.size()), 1, 0, 0, 0);
+        commandList_->RSSetViewports(1, &viewport_);
+        commandList_->RSSetScissorRects(1, &scissorRect_);
+
+        commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
+        commandList_->IASetIndexBuffer(&indexBufferView_);
+        commandList_->DrawIndexedInstanced(static_cast<UINT>(kIndices.size()), 1, 0, 0, 0);
+    }
 
     if (overlayCallback)
     {
@@ -922,19 +971,23 @@ void D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& 
     if (FAILED(hr))
     {
         logFailure("CommandList::Close", hr);
-        return;
+        return false;
     }
 
     ID3D12CommandList* const commandLists[] = {commandList_.Get()};
     commandQueue_->ExecuteCommandLists(1, commandLists);
+    pendingUpload_[backBufferIndex] = false;
 
     const UINT syncInterval = vsyncEnabled_ ? 1u : (allowTearing_ ? 0u : 1u);
     const UINT presentFlags = (!vsyncEnabled_ && allowTearing_) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
-    swapChain_->Present(syncInterval, presentFlags);
+    const HRESULT presentResult = swapChain_->Present(syncInterval, presentFlags);
+    presentationSlotReady_ = false;
+    lastPresentReturnTime_ = std::chrono::steady_clock::now();
 
     const std::uint64_t fenceValue = fenceValue_++;
     commandQueue_->Signal(fence_.Get(), fenceValue);
     frameContext.fenceValue = fenceValue;
+    return presentResult == S_OK;
 }
 
 bool D3DRenderer::createDevice(HWND)
@@ -1582,22 +1635,35 @@ void D3DRenderer::destroyRenderTarget()
     backBufferHeight_ = 0;
 }
 
-void D3DRenderer::waitForFrame(FrameContext& frameContext)
+bool D3DRenderer::waitForFrame(FrameContext& frameContext, DWORD timeoutMs)
 {
     if (!fence_ || frameContext.fenceValue == 0)
     {
-        return;
+        return true;
     }
 
     if (fence_->GetCompletedValue() >= frameContext.fenceValue)
     {
         frameContext.fenceValue = 0;
-        return;
+        return true;
     }
-
-    fence_->SetEventOnCompletion(frameContext.fenceValue, fenceEvent_);
-    WaitForSingleObject(fenceEvent_, INFINITE);
+    if (timeoutMs == 0 || !fenceEvent_)
+    {
+        return false;
+    }
+    if (FAILED(fence_->SetEventOnCompletion(frameContext.fenceValue, fenceEvent_)))
+    {
+        return false;
+    }
+    // Check the actual fence after waking: a bounded earlier wait may have left
+    // a signal for another fence value on this shared auto-reset event.
+    if (WaitForSingleObject(fenceEvent_, timeoutMs) != WAIT_OBJECT_0 ||
+        fence_->GetCompletedValue() < frameContext.fenceValue)
+    {
+        return false;
+    }
     frameContext.fenceValue = 0;
+    return true;
 }
 
 void D3DRenderer::waitForGpu()
@@ -1610,10 +1676,15 @@ void D3DRenderer::waitForGpu()
     const std::uint64_t fenceValue = fenceValue_++;
     if (SUCCEEDED(commandQueue_->Signal(fence_.Get(), fenceValue)))
     {
-        if (fence_->GetCompletedValue() < fenceValue)
+        // Bounded frame waits can leave an earlier completion signal pending.
+        // Always verify this fence before destroying resources on resize/exit.
+        while (fence_->GetCompletedValue() < fenceValue)
         {
-            fence_->SetEventOnCompletion(fenceValue, fenceEvent_);
-            WaitForSingleObject(fenceEvent_, INFINITE);
+            if (FAILED(fence_->SetEventOnCompletion(fenceValue, fenceEvent_)) ||
+                WaitForSingleObject(fenceEvent_, INFINITE) != WAIT_OBJECT_0)
+            {
+                return;
+            }
         }
     }
 }

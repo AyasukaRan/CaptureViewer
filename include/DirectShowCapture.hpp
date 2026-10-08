@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +26,8 @@ public:
         std::uint32_t height{};
         std::uint32_t stride{};
         std::uint64_t timestamp100ns{};
+        // Local monotonic arrival time, independent of DirectShow stream timestamps.
+        std::chrono::steady_clock::time_point receivedAt{};
         const std::uint8_t* data{};
         std::size_t dataSize{};
         PixelFormat pixelFormat = PixelFormat::BGRA8;

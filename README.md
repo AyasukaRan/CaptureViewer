@@ -1,5 +1,43 @@
 # Capture Viewer
 
+## Enhanced preview in this fork
+
+- **M** opens a separate ImGui settings window with Display, Capture and Audio tabs.
+- **F11** toggles fullscreen. Display settings offer a normal window, a borderless
+  window, and borderless fullscreen.
+- **F10** toggles a translucent top overlay showing measured capture FPS, preview
+  FPS, app latency and skipped old frames. Settings persist beside the executable.
+- Display scaling supports fit, stretch, native/downscale-only, fill/crop, and
+  custom 25-200% source-pixel scaling. This does not change the capture resolution.
+- The preview always selects the newest completed capture frame when ready to
+  upload. Older frames are skipped instead of queued for later playback. GPU
+  waits and uploads do not hold the capture publication lock. A frame arriving
+  after an upload has begun is eligible for the next render, not the in-flight one.
+- VSync defaults to off for new settings; existing saved preferences are retained.
+- The window title and icon identify CaptureViewer instead of Nintendo Switch 2.
+
+### What the performance readings mean
+
+**App latency** is elapsed time from this application's DirectShow buffer callback
+to the return of a successful `Present` call for that frame. The top bar shows the
+latest completed sample, plus average and peak over up to 120 samples. This is
+**not end-to-end HDMI latency**: capture hardware/USB time before the callback and
+GPU completion/display scanout after submission are not measured. See Microsoft's
+[Present documentation](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-present).
+
+**Capture FPS** counts received video frames. **Preview FPS** counts distinct video
+frames successfully submitted for presentation; repeated HUD redraws do not count.
+Rates use actual elapsed time over approximately 500 ms. The idle overlay refreshes
+at most four times per second so a stalled stream can show 0 FPS and stale latency.
+**Skipped** counts older captured frames bypassed between successful previews;
+it does not detect losses inside the capture card or driver. A GPU or monitor can
+display fewer frames than the submitted preview rate.
+
+The HUD alone keeps the capture-driven rendering path; opening the animated settings
+menu temporarily caps preview updates at 120 FPS. Close the menu for high-rate playback.
+
+---
+
 A fork of [CaptureKVM](https://github.com/PaulFreund/CaptureKVM) that focuses on being a simple low-latency viewer for HDMI capture devices on Windows. This fork is is compatible with any DirectShow capture source for video, and audio on devices that expose audio through the video filter (like the GC573) by default, but audio can be monitored from any audio input device. It's designed for streaming/remote play on the Switch 2, but will work with any device.
 
 You can use this viewer to play through the preview, stream to Discord, or use it as the video source for a [custom remote play setup 😉](https://www.youtube.com/watch?v=r0OW_0BuXs4) on consoles.

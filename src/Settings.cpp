@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -355,6 +356,12 @@ AppSettings SettingsManager::load()
     tryParseBool(content, "videoBorderlessWindowed", settings.videoBorderlessWindowed);
     tryParseBool(content, "videoFullscreen", settings.videoFullscreen);
     tryParseBool(content, "vsyncEnabled", settings.vsyncEnabled);
+    tryParseBool(content, "showLatencyOverlay", settings.showLatencyOverlay);
+    int videoScalePercent = static_cast<int>(settings.videoScalePercent);
+    if (tryParseInt(content, "videoScalePercent", videoScalePercent))
+    {
+        settings.videoScalePercent = static_cast<unsigned int>(std::clamp(videoScalePercent, 25, 200));
+    }
     tryParseInt(content, "windowPosX", settings.windowPosX);
     tryParseInt(content, "windowPosY", settings.windowPosY);
     tryParseUInt(content, "windowClientWidth", settings.windowClientWidth);
@@ -377,7 +384,7 @@ AppSettings SettingsManager::load()
     unsigned int aspectModeValue = static_cast<unsigned int>(settings.videoAspectMode);
     if (tryParseUInt(content, "videoAspectMode", aspectModeValue))
     {
-        if (aspectModeValue <= static_cast<unsigned int>(VideoAspectMode::Capture))
+        if (aspectModeValue <= static_cast<unsigned int>(VideoAspectMode::Custom))
         {
             settings.videoAspectMode = static_cast<VideoAspectMode>(aspectModeValue);
         }
@@ -429,6 +436,8 @@ void SettingsManager::save(const AppSettings& settings) const
     file << "  \"videoFullscreen\": " << (settings.videoFullscreen ? "true" : "false") << ",\n";
     file << "  \"vsyncEnabled\": " << (settings.vsyncEnabled ? "true" : "false") << ",\n";
     file << "  \"videoAspectMode\": " << static_cast<unsigned int>(settings.videoAspectMode) << ",\n";
+    file << "  \"videoScalePercent\": " << std::clamp(settings.videoScalePercent, 25u, 200u) << ",\n";
+    file << "  \"showLatencyOverlay\": " << (settings.showLatencyOverlay ? "true" : "false") << ",\n";
     file << "  \"videoFormatPreference\": " << static_cast<unsigned int>(settings.videoFormatPreference) << ",\n";
     file << "  \"windowPosX\": " << settings.windowPosX << ",\n";
     file << "  \"windowPosY\": " << settings.windowPosY << ",\n";

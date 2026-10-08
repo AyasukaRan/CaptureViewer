@@ -8,6 +8,8 @@ enum class VideoAspectMode : unsigned int {
     Stretch = 0,
     Maintain = 1,
     Capture = 2,
+    Fill = 3,
+    Custom = 4,
 };
 
 enum class VideoFormatPreference : unsigned int {
@@ -26,8 +28,10 @@ struct AppSettings {
     bool videoAllowResizing = true;
     bool videoBorderlessWindowed = true;
     bool videoFullscreen = false;
-    bool vsyncEnabled = true;
+    bool vsyncEnabled = false;
     VideoAspectMode videoAspectMode = VideoAspectMode::Maintain;
+    unsigned int videoScalePercent = 100;
+    bool showLatencyOverlay = true;
     VideoFormatPreference videoFormatPreference = VideoFormatPreference::Auto;
     int windowPosX = 0;
     int windowPosY = 0;
