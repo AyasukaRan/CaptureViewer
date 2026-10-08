@@ -27,6 +27,22 @@ You can use this viewer to play through the preview, stream to Discord, or use i
 
 2. Run the viewer from the generated `Release` (or `Debug`) output directory.
 
+## Windows x64 builds with GitHub Actions
+
+This fork includes the **Build Windows x64** workflow, which runs on pushes to
+`master` and can also be started from **Actions > Build Windows x64 > Run workflow**.
+It uses the `windows-2022` runner, Visual Studio 2022, CMake and the x64 Release
+configuration. The MSVC runtime is linked statically for portable use.
+
+After a successful run, download **CaptureViewer-Windows-x64** from its Artifacts
+section (GitHub sign-in required). Extract the ZIP and run `viewer.exe` on Windows
+11 x64. Press `M` for settings or `F11` for fullscreen. Artifacts are retained for
+90 days; rerun the workflow when a fresh download is needed.
+
+The package includes licenses, usage instructions, source/build information and
+a SHA-256 checksum. CI checks the executable's x64 PE headers; actual capture,
+audio, latency and high-frame-rate operation require testing with capture hardware.
+
 ## Runtime behaviour
 
 - Press `M` at any time to open an in-window settings menu. Device choices and feature toggles persist in `settings.json` beside the executable.

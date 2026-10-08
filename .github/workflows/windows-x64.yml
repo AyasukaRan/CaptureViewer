@@ -1,0 +1,64 @@
+name: Build Windows x64
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Configure x64 with static C++ runtime
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify executable and prepare portable package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'build/Release/viewer.exe'
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          if ([BitConverter]::ToUInt16($bytes, 0) -ne 0x5A4D) { throw 'Missing DOS header' }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550) { throw 'Missing PE header' }
+          if ([BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) { throw 'Executable is not AMD64/x64' }
+          if ([BitConverter]::ToUInt16($bytes, $peOffset + 24) -ne 0x020B) { throw 'Executable is not PE32+' }
+
+          $package = 'dist/CaptureViewer-Windows-x64'
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item $exe "$package/viewer.exe"
+          Copy-Item LICENSE, README.md, WINDOWS-QUICKSTART.txt -Destination $package
+          Copy-Item third_party/imgui/LICENSE.txt "$package/LICENSE-ImGui.txt"
+          @(
+            "Repository: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+            "Commit: $env:GITHUB_SHA"
+            "Build: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            'Target: Windows x64 Release, static MSVC runtime'
+            'Built on: GitHub-hosted windows-2022 with Visual Studio 2022'
+            'Validation: x64 PE headers; capture hardware testing is required separately'
+          ) | Set-Content "$package/BUILD-INFO.txt" -Encoding utf8
+          $hash = (Get-FileHash "$package/viewer.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  viewer.exe" | Set-Content "$package/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload portable Windows x64 package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: CaptureViewer-Windows-x64
+          path: dist/CaptureViewer-Windows-x64/
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,18 @@
+CaptureViewer - Windows x64 portable build
+
+1. Extract the complete downloaded ZIP into a writable folder on Windows 11 x64.
+2. Connect your HDMI capture device and install its drivers if required.
+3. Run viewer.exe. A Direct3D 12 capable GPU is required.
+4. Press M to open settings and choose the video and audio capture devices.
+5. Select a resolution, frame rate and pixel format supported by your device.
+6. Press F11 to toggle fullscreen. V-sync and window options are in settings.
+
+The application saves settings.json beside viewer.exe. Fonts, icons and shaders
+are embedded. This build statically links the MSVC C++ runtime.
+
+The GitHub Actions build verifies that viewer.exe is a 64-bit Windows executable.
+It does not verify HDMI capture, GC553G2 compatibility, latency or 240 FPS output;
+these must be tested with the actual Windows PC, GPU and capture device.
+
+See BUILD-INFO.txt for the source commit and build URL, SHA256SUMS.txt for the
+executable checksum, and README.md for more project details.
