@@ -1,4 +1,6 @@
 #include "DirectShowCapture.hpp"
+#include "CaptureCapabilities.hpp"
+#include "FrameRateOptions.hpp"
 
 #include <Windows.h>
 #include <OleAuto.h>
@@ -246,6 +248,8 @@ struct DirectShowCaptureImpl
 
     std::mutex errorMutex;
     std::string lastError;
+    mutable std::mutex deviceInfoMutex;
+    DirectShowCapture::DeviceInfo deviceInfo;
 
     std::atomic<bool> frameReceived{false};
 
@@ -294,6 +298,21 @@ struct DirectShowCaptureImpl
         if (!cb)
         {
             throw std::invalid_argument("Frame handler must not be empty");
+        }
+
+        if (running.load(std::memory_order_acquire))
+        {
+            throw std::runtime_error("Capture already running");
+        }
+        // An initialization/runtime failure can leave a completed, joinable worker.
+        if (worker.joinable())
+        {
+            worker.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(deviceInfoMutex);
+            deviceInfo = {};
+            deviceInfo.moniker = options.deviceMoniker;
         }
 
         handler = std::move(cb);
@@ -347,10 +366,7 @@ struct DirectShowCaptureImpl
 
     void stop()
     {
-        if (!running.exchange(false))
-        {
-            return;
-        }
+        running.store(false, std::memory_order_release);
 
         if (worker.joinable())
         {
@@ -362,8 +378,8 @@ struct DirectShowCaptureImpl
 
     std::string currentFriendlyName() const
     {
-        const std::wstring& source = !selectedFriendlyName.empty() ? selectedFriendlyName : selectedMonikerDisplayName;
-        return narrow(source);
+        std::lock_guard<std::mutex> lock(deviceInfoMutex);
+        return deviceInfo.friendlyName.empty() ? deviceInfo.moniker : deviceInfo.friendlyName;
     }
 
     void runCaptureThread()
@@ -372,6 +388,10 @@ struct DirectShowCaptureImpl
 
         auto finalizeInit = [this](std::exception_ptr err = nullptr) {
             std::lock_guard<std::mutex> lock(initMutex);
+            if (initCompleted)
+            {
+                return;
+            }
             initError = err;
             initCompleted = true;
             initCv.notify_all();
@@ -381,7 +401,6 @@ struct DirectShowCaptureImpl
         {
             selectCaptureDevice();
             buildGraph();
-            finalizeInit();
             logMessage("[Capture] Graph constructed");
 
             if (control)
@@ -389,6 +408,7 @@ struct DirectShowCaptureImpl
                 throwIfFailed(control->Run(), "Failed to start graph");
                 logMessage("[Capture] Graph running");
             }
+            finalizeInit();
 
             while (running.load(std::memory_order_acquire))
             {
@@ -550,6 +570,11 @@ struct DirectShowCaptureImpl
         }
 
         logMessage("[Capture] Using device: " + narrow(selectedFriendlyName.empty() ? selectedMonikerDisplayName : selectedFriendlyName));
+        {
+            std::lock_guard<std::mutex> lock(deviceInfoMutex);
+            deviceInfo.moniker = narrow(selectedMonikerDisplayName);
+            deviceInfo.friendlyName = narrow(selectedFriendlyName);
+        }
     }
 
     void buildGraph()
@@ -612,6 +637,26 @@ struct DirectShowCaptureImpl
                                                      IID_PPV_ARGS(streamConfig.GetAddressOf()));
         }
 
+        if (streamConfig)
+        {
+            auto modes = enumerateVideoModes(streamConfig.Get());
+            std::vector<::VideoFormatPreference> formats;
+            for (const auto& mode : modes)
+            {
+                if (std::find(formats.begin(), formats.end(), mode.format) == formats.end())
+                {
+                    formats.push_back(mode.format);
+                }
+            }
+            std::lock_guard<std::mutex> lock(deviceInfoMutex);
+            deviceInfo.modes = std::move(modes);
+            deviceInfo.formats = std::move(formats);
+        }
+        else if (requestedWidth || requestedHeight || requestedFrameRate100)
+        {
+            throw std::runtime_error("The capture device does not expose configurable video modes. Check its driver or try another capture device.");
+        }
+
         GUID requestedSubtype = kPreferredVideoSubtypeXrgb;
         switch (requestedFormatPreference)
         {
@@ -666,6 +711,29 @@ struct DirectShowCaptureImpl
         }
 
         logSampleGrabberFormat();
+        // RenderStream may insert filters and renegotiate the source. Validate the format
+        // delivered to the callback, rather than assuming SetFormat survived connection.
+        if ((requestedWidth && requestedWidth != frameWidth) ||
+            (requestedHeight && requestedHeight != frameHeight))
+        {
+            throw std::runtime_error("The connected capture stream changed the requested resolution.");
+        }
+        if (requestedFrameRate100 && requestedFrameRate100 != activeFrameRate100)
+        {
+            std::ostringstream message;
+            message << "Requested " << std::fixed << std::setprecision(2)
+                    << static_cast<double>(requestedFrameRate100) / 100.0
+                    << " FPS, but the connected stream selected "
+                    << static_cast<double>(activeFrameRate100) / 100.0 << " FPS.";
+            const auto difference = activeFrameRate100 > requestedFrameRate100
+                ? activeFrameRate100 - requestedFrameRate100 : requestedFrameRate100 - activeFrameRate100;
+            if (!activeFrameRate100 || difference > std::max<std::uint32_t>(1, requestedFrameRate100 / 100))
+            {
+                throw std::runtime_error(message.str());
+            }
+            std::lock_guard<std::mutex> lock(deviceInfoMutex);
+            deviceInfo.warning = message.str();
+        }
 
         ComPtr<IMediaFilter> mediaFilter;
         if (SUCCEEDED(graph.As(&mediaFilter)) && mediaFilter)
@@ -687,129 +755,207 @@ struct DirectShowCaptureImpl
         int capabilitySize = 0;
         if (FAILED(streamConfig->GetNumberOfCapabilities(&capabilityCount, &capabilitySize)) || capabilityCount <= 0 || capabilitySize <= 0)
         {
-            logMessage("[Capture] Unable to enumerate stream capabilities");
-            return defaultSubtype;
+            throw std::runtime_error("Unable to read capture modes from the device.");
         }
 
         const bool hasRequestedResolution = requestedWidth != 0 && requestedHeight != 0;
         const bool hasRequestedFrameRate = requestedFrameRate100 != 0;
-
-        auto subtypeScore = [this](const GUID& subtype) {
-            switch (requestedFormatPreference)
+        const auto formatRate = [](std::uint32_t rate) {
+            std::ostringstream text;
+            text << std::fixed << std::setprecision(2) << static_cast<double>(rate) / 100.0;
+            return text.str();
+        };
+        const auto mediaTypeDeleter = [](AM_MEDIA_TYPE* type) {
+            if (type)
             {
-            case DirectShowCapture::VideoFormatPreference::XRGB:
-                if (isXrgb32CompatibleSubtype(subtype)) return 450;
-                if (isSubtype(subtype, kPreferredVideoSubtypeRgb24)) return 350;
-                if (isSubtype(subtype, kPreferredVideoSubtypeNv12)) return 250;
-                return 100;
-            case DirectShowCapture::VideoFormatPreference::NV12:
-                if (isSubtype(subtype, kPreferredVideoSubtypeNv12)) return 450;
-                if (isXrgb32CompatibleSubtype(subtype)) return 300;
-                if (isSubtype(subtype, kPreferredVideoSubtypeRgb24)) return 250;
-                return 100;
-            case DirectShowCapture::VideoFormatPreference::Auto:
-            default:
-                if (isXrgb32CompatibleSubtype(subtype)) return 450;
-                if (isSubtype(subtype, kPreferredVideoSubtypeNv12)) return 400;
-                if (isSubtype(subtype, kPreferredVideoSubtypeRgb24)) return 300;
-                return 100;
+                freeMediaType(*type);
+                CoTaskMemFree(type);
             }
         };
-
+        using MediaTypePtr = std::unique_ptr<AM_MEDIA_TYPE, decltype(mediaTypeDeleter)>;
+        struct Candidate
+        {
+            MediaTypePtr type;
+            int score;
+        };
+        std::vector<Candidate> candidates;
         std::vector<std::uint8_t> capabilityBuffer(static_cast<std::size_t>(capabilitySize));
-        AM_MEDIA_TYPE* best = nullptr;
-        int bestScore = std::numeric_limits<int>::min();
-
         for (int i = 0; i < capabilityCount; ++i)
         {
-            AM_MEDIA_TYPE* mediaType = nullptr;
-            if (FAILED(streamConfig->GetStreamCaps(i, &mediaType, capabilityBuffer.data())) || !mediaType)
+            std::fill(capabilityBuffer.begin(), capabilityBuffer.end(), 0);
+            AM_MEDIA_TYPE* raw = nullptr;
+            const HRESULT hr = streamConfig->GetStreamCaps(i, &raw, capabilityBuffer.data());
+            MediaTypePtr type(raw, mediaTypeDeleter);
+            if (FAILED(hr) || !type)
+            {
+                continue;
+            }
+            auto* info = CaptureCapabilities::videoInfo(type.get());
+            if (!info)
+            {
+                continue;
+            }
+            const bool nv12 = isSubtype(type->subtype, kPreferredVideoSubtypeNv12);
+            if ((requestedFormatPreference == DirectShowCapture::VideoFormatPreference::NV12 && !nv12) ||
+                (requestedFormatPreference == DirectShowCapture::VideoFormatPreference::XRGB && nv12))
+            {
+                continue;
+            }
+            if (hasRequestedResolution &&
+                (static_cast<std::uint32_t>(info->bmiHeader.biWidth) != requestedWidth ||
+                 static_cast<std::uint32_t>(info->bmiHeader.biHeight) != requestedHeight))
             {
                 continue;
             }
 
-            const bool hasVideoInfo = mediaType->formattype == FORMAT_VideoInfo && mediaType->cbFormat >= sizeof(VIDEOINFOHEADER) && mediaType->pbFormat;
-            if (!hasVideoInfo)
-            {
-                freeMediaType(*mediaType);
-                CoTaskMemFree(mediaType);
-                continue;
-            }
-
-            const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(mediaType->pbFormat);
-            const std::uint32_t width = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biWidth));
-            const std::uint32_t height = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biHeight));
-
-            if (hasRequestedResolution && (width != requestedWidth || height != requestedHeight))
-            {
-                freeMediaType(*mediaType);
-                CoTaskMemFree(mediaType);
-                continue;
-            }
-
-            std::uint32_t candidateRate100 = 0;
-            if (vih->AvgTimePerFrame > 0)
-            {
-                const double frameRate = 10'000'000.0 / static_cast<double>(vih->AvgTimePerFrame);
-                candidateRate100 = static_cast<std::uint32_t>(std::llround(frameRate * 100.0));
-            }
-
-            int score = subtypeScore(mediaType->subtype);
+            const auto caps = CaptureCapabilities::streamCaps(capabilityBuffer.data(), capabilityBuffer.size());
+            const auto defaultRate = FrameRateOptions::rateForInterval(info->AvgTimePerFrame);
+            int score = isXrgb32CompatibleSubtype(type->subtype) ? 450 : (nv12 ? 400 : 300);
             if (hasRequestedFrameRate)
             {
-                if (candidateRate100 == requestedFrameRate100)
+                if (!FrameRateOptions::allowsRate(info->AvgTimePerFrame, caps.MinFrameInterval,
+                                                  caps.MaxFrameInterval, requestedFrameRate100))
+                {
+                    continue;
+                }
+                if (defaultRate == requestedFrameRate100)
                 {
                     score += 10000;
                 }
-                else if (candidateRate100 > 0)
+                // Request the interval explicitly for range-based modes. Preserve a matching
+                // native interval exactly: rounding FPS to two decimals and back can shift
+                // one tick, which strict discrete-mode drivers may reject.
+                if (defaultRate != requestedFrameRate100)
                 {
-                    const int diff = static_cast<int>(std::abs(static_cast<int>(candidateRate100) - static_cast<int>(requestedFrameRate100)));
-                    score += std::max(0, 5000 - diff);
+                    info->AvgTimePerFrame = FrameRateOptions::intervalForRate(requestedFrameRate100);
                 }
             }
+            candidates.push_back({std::move(type), score});
+        }
+        std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            return a.score > b.score;
+        });
+        if (candidates.empty())
+        {
+            std::ostringstream message;
+            message << "The device does not advertise a compatible ";
+            if (hasRequestedResolution) message << requestedWidth << "x" << requestedHeight << " ";
+            if (hasRequestedFrameRate) message << formatRate(requestedFrameRate100) << " FPS ";
+            message << "capture mode. Select an available mode and try Automatic color format.";
+            throw std::runtime_error(message.str());
+        }
 
-            if (score > bestScore)
+        // Drivers can round requested rates. Keep a close alternative while looking for an
+        // exact match in another supported subtype, instead of silently choosing the first one.
+        MediaTypePtr roundedFallback(nullptr, mediaTypeDeleter);
+        std::uint32_t smallestDifference = std::numeric_limits<std::uint32_t>::max();
+        std::string lastFailure = "The device rejected the requested capture mode.";
+        const auto acceptActual = [&](AM_MEDIA_TYPE* actual, bool allowRounded) -> bool {
+            const auto* info = CaptureCapabilities::videoInfo(actual);
+            if (!info)
             {
-                if (best)
+                lastFailure = "The device returned an unsupported capture format.";
+                return false;
+            }
+            const bool actualNv12 = isSubtype(actual->subtype, kPreferredVideoSubtypeNv12);
+            if ((requestedFormatPreference == DirectShowCapture::VideoFormatPreference::NV12 && !actualNv12) ||
+                (requestedFormatPreference == DirectShowCapture::VideoFormatPreference::XRGB && actualNv12))
+            {
+                lastFailure = "The device changed the requested color format. Try Automatic color format.";
+                return false;
+            }
+            if (hasRequestedResolution &&
+                (static_cast<std::uint32_t>(info->bmiHeader.biWidth) != requestedWidth ||
+                 static_cast<std::uint32_t>(info->bmiHeader.biHeight) != requestedHeight))
+            {
+                lastFailure = "The device changed the requested capture resolution.";
+                return false;
+            }
+            const auto rate = FrameRateOptions::rateForInterval(info->AvgTimePerFrame);
+            if (hasRequestedFrameRate && rate != requestedFrameRate100)
+            {
+                lastFailure = "Requested " + formatRate(requestedFrameRate100) +
+                              " FPS, but the device selected " + formatRate(rate) + " FPS.";
+                if (!allowRounded)
                 {
-                    freeMediaType(*best);
-                    CoTaskMemFree(best);
+                    return false;
                 }
-                best = mediaType;
-                bestScore = score;
+            }
+            {
+                std::lock_guard<std::mutex> lock(deviceInfoMutex);
+                deviceInfo.width = static_cast<std::uint32_t>(info->bmiHeader.biWidth);
+                deviceInfo.height = static_cast<std::uint32_t>(info->bmiHeader.biHeight);
+                deviceInfo.frameRate100 = rate;
+                deviceInfo.warning = hasRequestedFrameRate && rate != requestedFrameRate100 ? lastFailure : std::string{};
+            }
+            logMessage("[Capture] Applied " + std::to_string(info->bmiHeader.biWidth) + "x" +
+                       std::to_string(info->bmiHeader.biHeight) + " @" + formatRate(rate) +
+                       " FPS subtype=" + subtypeName(actual->subtype));
+            return true;
+        };
+
+        for (auto& candidate : candidates)
+        {
+            const HRESULT setResult = streamConfig->SetFormat(candidate.type.get());
+            if (FAILED(setResult))
+            {
+                lastFailure = "The device rejected the requested capture mode: " + formatHr(setResult);
+                logMessage("[Capture] " + lastFailure);
                 continue;
             }
-
-            freeMediaType(*mediaType);
-            CoTaskMemFree(mediaType);
-        }
-
-        if (!best)
-        {
-            if (hasRequestedResolution)
+            AM_MEDIA_TYPE* rawActual = nullptr;
+            const HRESULT getResult = streamConfig->GetFormat(&rawActual);
+            MediaTypePtr actual(rawActual, mediaTypeDeleter);
+            if (FAILED(getResult) || !actual)
             {
-                logMessage("[Capture] Requested capture resolution not found in stream capabilities");
+                lastFailure = "The device accepted the capture setting but its actual format could not be read back.";
+                continue;
             }
-            return defaultSubtype;
+            if (acceptActual(actual.get(), false))
+            {
+                return actual->subtype;
+            }
+            logMessage("[Capture] " + lastFailure);
+            if (const auto* info = CaptureCapabilities::videoInfo(actual.get()))
+            {
+                const auto actualRate = FrameRateOptions::rateForInterval(info->AvgTimePerFrame);
+                const auto difference = actualRate > requestedFrameRate100
+                    ? actualRate - requestedFrameRate100 : requestedFrameRate100 - actualRate;
+                const bool dimensionsMatch = !hasRequestedResolution ||
+                    (static_cast<std::uint32_t>(info->bmiHeader.biWidth) == requestedWidth &&
+                     static_cast<std::uint32_t>(info->bmiHeader.biHeight) == requestedHeight);
+                const bool actualNv12 = isSubtype(actual->subtype, kPreferredVideoSubtypeNv12);
+                const bool formatMatches = requestedFormatPreference == DirectShowCapture::VideoFormatPreference::Auto ||
+                    (requestedFormatPreference == DirectShowCapture::VideoFormatPreference::NV12 && actualNv12) ||
+                    (requestedFormatPreference == DirectShowCapture::VideoFormatPreference::XRGB && !actualNv12);
+                // Permit ordinary fractional-rate rounding (e.g. 60 -> 59.94), never a
+                // silent 240 -> 60 FPS fallback. The UI receives requested-vs-actual text.
+                if (hasRequestedFrameRate && dimensionsMatch && formatMatches && actualRate != 0 &&
+                    difference <= std::max<std::uint32_t>(1, requestedFrameRate100 / 100) &&
+                    difference < smallestDifference)
+                {
+                    smallestDifference = difference;
+                    roundedFallback = std::move(actual);
+                }
+            }
         }
-
-        const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(best->pbFormat);
-        const std::uint32_t width = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biWidth));
-        const std::uint32_t height = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biHeight));
-        const GUID selectedSubtype = best->subtype;
-
-        if (SUCCEEDED(streamConfig->SetFormat(best)))
+        if (roundedFallback && SUCCEEDED(streamConfig->SetFormat(roundedFallback.get())))
         {
-            logMessage("[Capture] Applied stream format " + std::to_string(width) + "x" + std::to_string(height) + " subtype=" + subtypeName(selectedSubtype));
+            AM_MEDIA_TYPE* rawActual = nullptr;
+            const HRESULT getResult = streamConfig->GetFormat(&rawActual);
+            MediaTypePtr actual(rawActual, mediaTypeDeleter);
+            const auto* info = actual ? CaptureCapabilities::videoInfo(actual.get()) : nullptr;
+            const auto actualRate = info ? FrameRateOptions::rateForInterval(info->AvgTimePerFrame) : 0;
+            const auto difference = actualRate > requestedFrameRate100
+                ? actualRate - requestedFrameRate100 : requestedFrameRate100 - actualRate;
+            if (SUCCEEDED(getResult) && actualRate != 0 &&
+                difference <= std::max<std::uint32_t>(1, requestedFrameRate100 / 100) &&
+                acceptActual(actual.get(), true))
+            {
+                return actual->subtype;
+            }
         }
-        else
-        {
-            logMessage("[Capture] Failed to apply preferred stream format; continuing with device default");
-        }
-
-        freeMediaType(*best);
-        CoTaskMemFree(best);
-        return selectedSubtype;
+        throw std::runtime_error(lastFailure + " Select another listed rate or color format.");
     }
 
     void logCurrentFormat(const std::string& context)
@@ -847,7 +993,8 @@ struct DirectShowCaptureImpl
             return;
         }
 
-        const bool hasVideoInfo = currentType->formattype == FORMAT_VideoInfo && currentType->cbFormat >= sizeof(VIDEOINFOHEADER);
+        const bool hasVideoInfo = currentType->formattype == FORMAT_VideoInfo &&
+            currentType->cbFormat >= sizeof(VIDEOINFOHEADER) && currentType->pbFormat;
         if (!hasVideoInfo)
         {
             logMessage("[Capture] " + context + ": unexpected media type");
@@ -890,14 +1037,13 @@ struct DirectShowCaptureImpl
             return;
         }
 
-        const bool hasVideoInfo = connected.formattype == FORMAT_VideoInfo && connected.cbFormat >= sizeof(VIDEOINFOHEADER);
-        if (!hasVideoInfo)
+        const auto* vih = CaptureCapabilities::videoInfo(&connected);
+        if (!vih)
         {
             freeMediaType(connected);
-            throw std::runtime_error("Sample Grabber did not provide a VIDEOINFOHEADER");
+            throw std::runtime_error("Sample Grabber did not provide a supported RGB or NV12 capture format.");
         }
 
-        const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(connected.pbFormat);
         describeVideoInfo(*vih, connected.subtype, "SampleGrabber format", true);
         freeMediaType(connected);
     }
@@ -996,6 +1142,10 @@ struct DirectShowCaptureImpl
             contentRight = static_cast<std::uint32_t>(active.right);
             contentBottom = static_cast<std::uint32_t>(active.bottom);
             activeFrameRate100 = nominalFrameRate100;
+            std::lock_guard<std::mutex> lock(deviceInfoMutex);
+            deviceInfo.width = width;
+            deviceInfo.height = height;
+            deviceInfo.frameRate100 = nominalFrameRate100;
         }
     }
 
@@ -1187,12 +1337,20 @@ struct DirectShowCaptureImpl
         {
             std::lock_guard<std::mutex> lock(errorMutex);
             lastError = ex.what();
+            {
+                std::lock_guard<std::mutex> infoLock(deviceInfoMutex);
+                deviceInfo.warning = lastError;
+            }
             logMessage(std::string("[Capture] Runtime exception: ") + lastError);
         }
         catch (...)
         {
             std::lock_guard<std::mutex> lock(errorMutex);
             lastError = "Unknown capture error";
+            {
+                std::lock_guard<std::mutex> infoLock(deviceInfoMutex);
+                deviceInfo.warning = lastError;
+            }
             logMessage("[Capture] Runtime exception: unknown");
         }
     }
@@ -1236,4 +1394,10 @@ std::string DirectShowCapture::consumeLastError()
 std::string DirectShowCapture::currentDeviceFriendlyName() const
 {
     return impl_->currentFriendlyName();
+}
+
+DirectShowCapture::DeviceInfo DirectShowCapture::deviceInfo() const
+{
+    std::lock_guard<std::mutex> lock(impl_->deviceInfoMutex);
+    return impl_->deviceInfo;
 }

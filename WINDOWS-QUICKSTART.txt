@@ -12,6 +12,14 @@ CaptureViewer - Windows x64 portable build
    Custom 100% maps one source pixel to one display pixel. It does not change
    the capture resolution. Close the menu for high-frame-rate playback.
 
+Frame-rate selection (v1.1.1):
+- M > Capture > Capture Format: Auto, choose resolution, then Requested Capture FPS.
+- The FPS list reads the selected driver's mode and frame-interval capabilities.
+- Active capture mode shows the negotiated setting; the top CAPTURE FPS is measured.
+- Driver rejection or fractional-rate rounding is explained in the Capture tab.
+- If only 60 FPS is available, try another format/resolution. Refresh devices and
+  modes restarts capture and rereads the driver's capabilities.
+
 The preview keeps the latest received frame and skips older frames rather than
 playing a delayed queue. VSync defaults off unless an existing settings file
 enables it. Skipped counts old frames bypassed by the application.

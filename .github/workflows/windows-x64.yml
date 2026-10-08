@@ -28,7 +28,7 @@ jobs:
       - name: Build Release
         run: cmake --build build --config Release --parallel
 
-      - name: Test frame timing, frame rates and viewport scaling
+      - name: Test capture capabilities, frame timing and viewport scaling
         run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Smoke test Windows UI without capture hardware

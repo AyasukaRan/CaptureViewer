@@ -1,5 +1,7 @@
 #pragma once
 
+#include "DeviceEnumeration.hpp"
+
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -52,6 +54,17 @@ public:
         VideoFormatPreference videoFormatPreference = VideoFormatPreference::XRGB;
     };
 
+    struct DeviceInfo {
+        std::string moniker;
+        std::string friendlyName;
+        std::string warning;
+        std::vector<VideoModeInfo> modes;
+        std::vector<::VideoFormatPreference> formats;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t frameRate100 = 0;
+    };
+
     DirectShowCapture();
     ~DirectShowCapture();
 
@@ -60,6 +73,7 @@ public:
 
     [[nodiscard]] std::string consumeLastError();
     [[nodiscard]] std::string currentDeviceFriendlyName() const;
+    [[nodiscard]] DeviceInfo deviceInfo() const;
 
     DirectShowCapture(const DirectShowCapture&) = delete;
     DirectShowCapture& operator=(const DirectShowCapture&) = delete;

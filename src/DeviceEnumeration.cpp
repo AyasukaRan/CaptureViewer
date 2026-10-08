@@ -1,4 +1,6 @@
 #include "DeviceEnumeration.hpp"
+#include "CaptureCapabilities.hpp"
+#include "FrameRateOptions.hpp"
 
 #include <Windows.h>
 #include <SetupAPI.h>
@@ -293,193 +295,91 @@ std::vector<VideoModeInfo> enumerateVideoModes(const std::string& monikerDisplay
         return modes;
     }
 
-    int capabilityCount = 0;
-    int capabilitySize = 0;
-    if (FAILED(streamConfig->GetNumberOfCapabilities(&capabilityCount, &capabilitySize)) || capabilityCount <= 0 || capabilitySize <= 0)
+    return enumerateVideoModes(streamConfig.Get());
+}
+
+std::vector<VideoModeInfo> enumerateVideoModes(IAMStreamConfig* streamConfig)
+{
+    std::vector<VideoModeInfo> modes;
+    if (!streamConfig)
     {
         return modes;
     }
 
-    std::vector<std::uint8_t> capabilityBuffer(static_cast<std::size_t>(capabilitySize));
-    std::vector<VideoModeInfo> uniqueModes;
+    int capabilityCount = 0;
+    int capabilitySize = 0;
+    if (FAILED(streamConfig->GetNumberOfCapabilities(&capabilityCount, &capabilitySize)) || capabilityCount <= 0 || capabilitySize <= 0)
+    {
+        logFormatEnum("Unable to read capture capabilities");
+        return modes;
+    }
 
+    std::vector<std::uint8_t> capabilityBuffer(static_cast<std::size_t>(capabilitySize));
     for (int i = 0; i < capabilityCount; ++i)
     {
+        std::fill(capabilityBuffer.begin(), capabilityBuffer.end(), 0);
         AM_MEDIA_TYPE* mediaType = nullptr;
-        if (FAILED(streamConfig->GetStreamCaps(i, &mediaType, capabilityBuffer.data())) || !mediaType)
+        const HRESULT hr = streamConfig->GetStreamCaps(i, &mediaType, capabilityBuffer.data());
+        if (FAILED(hr) || !mediaType)
         {
+            if (mediaType)
+            {
+                freeMediaType(*mediaType);
+                CoTaskMemFree(mediaType);
+            }
             continue;
         }
 
-        if (mediaType->formattype == FORMAT_VideoInfo && mediaType->cbFormat >= sizeof(VIDEOINFOHEADER) && mediaType->pbFormat)
+        if (const auto* info = CaptureCapabilities::videoInfo(mediaType))
         {
-            const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(mediaType->pbFormat);
-            const std::uint32_t width = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biWidth));
-            const std::uint32_t height = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biHeight));
-            double frameRate = 0.0;
-            if (vih->AvgTimePerFrame > 0)
+            const auto caps = CaptureCapabilities::streamCaps(capabilityBuffer.data(), capabilityBuffer.size());
+            const auto rates = FrameRateOptions::enumerate(info->AvgTimePerFrame, caps.MinFrameInterval, caps.MaxFrameInterval);
+            for (const auto rate : rates)
             {
-                frameRate = 10'000'000.0 / static_cast<double>(vih->AvgTimePerFrame);
-            }
-
-            const auto alreadyExists = std::find_if(uniqueModes.begin(), uniqueModes.end(), [&](const VideoModeInfo& existing) {
-                return existing.width == width &&
-                       existing.height == height &&
-                       std::abs(existing.frameRate - frameRate) < 0.01;
-            });
-            if (alreadyExists == uniqueModes.end())
-            {
-                VideoModeInfo mode;
-                mode.width = width;
-                mode.height = height;
-                mode.frameRate = frameRate;
-                uniqueModes.push_back(mode);
+                const VideoModeInfo mode{
+                    static_cast<std::uint32_t>(info->bmiHeader.biWidth),
+                    static_cast<std::uint32_t>(info->bmiHeader.biHeight),
+                    static_cast<double>(rate) / 100.0,
+                    CaptureCapabilities::formatPreference(mediaType->subtype)
+                };
+                const bool duplicate = std::any_of(modes.begin(), modes.end(), [&](const VideoModeInfo& existing) {
+                    return existing.width == mode.width && existing.height == mode.height &&
+                           existing.format == mode.format && std::abs(existing.frameRate - mode.frameRate) < 0.005;
+                });
+                if (!duplicate)
+                {
+                    modes.push_back(mode);
+                }
             }
         }
-
+        else
+        {
+            logFormatEnum("Skipping unsupported capture format " + guidToString(mediaType->formattype) +
+                          " subtype=" + mediaSubtypeName(mediaType->subtype));
+        }
         freeMediaType(*mediaType);
         CoTaskMemFree(mediaType);
     }
 
-    modes = std::move(uniqueModes);
     std::sort(modes.begin(), modes.end(), [](const VideoModeInfo& a, const VideoModeInfo& b) {
-        if (a.width != b.width)
-        {
-            return a.width > b.width;
-        }
-        if (a.height != b.height)
-        {
-            return a.height > b.height;
-        }
-        return a.frameRate < b.frameRate;
+        if (a.width != b.width) return a.width > b.width;
+        if (a.height != b.height) return a.height > b.height;
+        if (a.frameRate != b.frameRate) return a.frameRate < b.frameRate;
+        return a.format < b.format;
     });
-
+    logFormatEnum("Found " + std::to_string(modes.size()) + " compatible capture mode/rate choices");
     return modes;
 }
 
 std::vector<VideoFormatPreference> enumerateVideoFormats(const std::string& monikerDisplayName)
 {
     std::vector<VideoFormatPreference> formats;
-    if (monikerDisplayName.empty())
+    for (const auto& mode : enumerateVideoModes(monikerDisplayName))
     {
-        return formats;
-    }
-
-    logFormatEnum("Enumerating formats for device moniker: " + monikerDisplayName);
-
-    ScopedCoInit coInit(COINIT_MULTITHREADED);
-
-    ComPtr<IGraphBuilder> graph;
-    if (FAILED(CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&graph))))
-    {
-        return formats;
-    }
-
-    ComPtr<ICaptureGraphBuilder2> builder;
-    if (FAILED(CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&builder))))
-    {
-        return formats;
-    }
-
-    if (FAILED(builder->SetFiltergraph(graph.Get())))
-    {
-        return formats;
-    }
-
-    const std::wstring monikerWide = utf8ToWide(monikerDisplayName);
-    if (monikerWide.empty())
-    {
-        return formats;
-    }
-
-    ComPtr<IBindCtx> bindCtx;
-    if (FAILED(CreateBindCtx(0, &bindCtx)))
-    {
-        return formats;
-    }
-
-    ULONG eaten = 0;
-    ComPtr<IMoniker> moniker;
-    if (FAILED(MkParseDisplayName(bindCtx.Get(), monikerWide.c_str(), &eaten, moniker.GetAddressOf())) || !moniker)
-    {
-        return formats;
-    }
-
-    ComPtr<IBaseFilter> captureFilter;
-    if (FAILED(moniker->BindToObject(nullptr, nullptr, IID_PPV_ARGS(&captureFilter))) || !captureFilter)
-    {
-        return formats;
-    }
-
-    if (FAILED(graph->AddFilter(captureFilter.Get(), L"Source")))
-    {
-        return formats;
-    }
-
-    ComPtr<IAMStreamConfig> streamConfig;
-    HRESULT hr = builder->FindInterface(&PIN_CATEGORY_CAPTURE,
-                                        &MEDIATYPE_Video,
-                                        captureFilter.Get(),
-                                        IID_PPV_ARGS(streamConfig.GetAddressOf()));
-    if (FAILED(hr) || !streamConfig)
-    {
-        hr = builder->FindInterface(&PIN_CATEGORY_PREVIEW,
-                                    &MEDIATYPE_Video,
-                                    captureFilter.Get(),
-                                    IID_PPV_ARGS(streamConfig.GetAddressOf()));
-    }
-
-    if (FAILED(hr) || !streamConfig)
-    {
-        return formats;
-    }
-
-    int capabilityCount = 0;
-    int capabilitySize = 0;
-    if (FAILED(streamConfig->GetNumberOfCapabilities(&capabilityCount, &capabilitySize)) || capabilityCount <= 0 || capabilitySize <= 0)
-    {
-        return formats;
-    }
-
-    bool hasXrgb = false;
-    bool hasNv12 = false;
-    std::vector<std::uint8_t> capabilityBuffer(static_cast<std::size_t>(capabilitySize));
-
-    for (int i = 0; i < capabilityCount; ++i)
-    {
-        AM_MEDIA_TYPE* mediaType = nullptr;
-        if (FAILED(streamConfig->GetStreamCaps(i, &mediaType, capabilityBuffer.data())) || !mediaType)
+        if (std::find(formats.begin(), formats.end(), mode.format) == formats.end())
         {
-            logFormatEnum("cap[" + std::to_string(i) + "]: GetStreamCaps failed");
-            continue;
+            formats.push_back(mode.format);
         }
-
-        if (isXrgbCompatibleSubtype(mediaType->subtype))
-        {
-            hasXrgb = true;
-        }
-        else if (InlineIsEqualGUID(mediaType->subtype, MEDIASUBTYPE_NV12))
-        {
-            hasNv12 = true;
-        }
-
-        freeMediaType(*mediaType);
-        CoTaskMemFree(mediaType);
     }
-
-    if (hasXrgb)
-    {
-        formats.push_back(VideoFormatPreference::XRGB);
-    }
-    if (hasNv12)
-    {
-        formats.push_back(VideoFormatPreference::NV12);
-    }
-
-    if (formats.empty())
-    {
-        formats.push_back(VideoFormatPreference::Auto);
-    }
-
     return formats;
 }

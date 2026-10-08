@@ -369,6 +369,11 @@ void OverlayUI::refreshDeviceLists(Application& app)
     audioDevices_ = enumerateAudioCaptureDevices();
     audioRenderDevices_ = enumerateAudioRenderDevices();
 
+    refreshCaptureCapabilities(app);
+}
+
+void OverlayUI::refreshCaptureCapabilities(Application& app)
+{
     refreshVideoModes(app);
     refreshVideoFormats(app);
 }
@@ -382,7 +387,8 @@ void OverlayUI::refreshVideoModes(Application& app)
         return;
     }
 
-    videoModes_ = enumerateVideoModes(moniker);
+    const auto active = app.directShowCapture_.deviceInfo();
+    videoModes_ = active.moniker == moniker ? active.modes : enumerateVideoModes(moniker);
 }
 
 void OverlayUI::refreshVideoFormats(Application& app)
@@ -394,7 +400,8 @@ void OverlayUI::refreshVideoFormats(Application& app)
         return;
     }
 
-    videoFormats_ = enumerateVideoFormats(moniker);
+    const auto active = app.directShowCapture_.deviceInfo();
+    videoFormats_ = active.moniker == moniker ? active.formats : enumerateVideoFormats(moniker);
 }
 
 void OverlayUI::drawPerformanceOverlay(Application& app)
@@ -558,7 +565,11 @@ void OverlayUI::drawMenuWindow(Application& app)
     if (ImGui::BeginTabItem("Capture"))
     {
     ImGui::Spacing();
-    if (ImGui::Button("Refresh devices and modes")) { refreshDeviceLists(app); }
+    if (ImGui::Button("Refresh devices and modes"))
+    {
+        app.restartVideoCapture();
+        refreshDeviceLists(app);
+    }
     if (!app.captureStatus_.empty())
     {
         ImGui::TextWrapped("Capture unavailable: %s", app.captureStatus_.c_str());
@@ -601,10 +612,15 @@ void OverlayUI::drawMenuWindow(Application& app)
         resolutionLabel = std::to_string(app.settings().videoPreferredWidth) + "x" + std::to_string(app.settings().videoPreferredHeight);
     }
 
+    const auto matchesFormat = [&](const VideoModeInfo& mode) {
+        return app.settings().videoFormatPreference == VideoFormatPreference::Auto ||
+            mode.format == app.settings().videoFormatPreference;
+    };
     std::vector<std::pair<std::uint32_t, std::uint32_t>> resolutionOptions;
     resolutionOptions.reserve(videoModes_.size());
     for (const auto& mode : videoModes_)
     {
+        if (!matchesFormat(mode)) { continue; }
         const auto exists = std::find_if(resolutionOptions.begin(), resolutionOptions.end(), [&](const auto& entry) {
             return entry.first == mode.width && entry.second == mode.height;
         });
@@ -629,12 +645,10 @@ void OverlayUI::drawMenuWindow(Application& app)
                     app.settings().videoPreferredHeight == height;
                 if (ImGui::Selectable(modeLabel.c_str(), selected))
                 {
-                    app.setVideoResolution(width, height);
-
                     std::vector<std::uint32_t> ratesForResolution;
                     for (const auto& candidate : videoModes_)
                     {
-                        if (candidate.width == width && candidate.height == height)
+                        if (candidate.width == width && candidate.height == height && matchesFormat(candidate))
                         {
                             const std::uint32_t rate100 = static_cast<std::uint32_t>(std::llround(candidate.frameRate * 100.0));
                             if (rate100 != 0 && std::find(ratesForResolution.begin(), ratesForResolution.end(), rate100) == ratesForResolution.end())
@@ -643,20 +657,17 @@ void OverlayUI::drawMenuWindow(Application& app)
                             }
                         }
                     }
+                    std::uint32_t preferred = app.settings().videoPreferredFrameRate100;
                     if (!ratesForResolution.empty())
                     {
                         std::sort(ratesForResolution.begin(), ratesForResolution.end());
-                        std::uint32_t preferred = ratesForResolution.front();
-                        if (std::find(ratesForResolution.begin(), ratesForResolution.end(), 6000) != ratesForResolution.end())
+                        if (std::find(ratesForResolution.begin(), ratesForResolution.end(), preferred) == ratesForResolution.end())
                         {
-                            preferred = 6000;
+                            preferred = std::find(ratesForResolution.begin(), ratesForResolution.end(), 6000) != ratesForResolution.end()
+                                ? 6000 : ratesForResolution.back();
                         }
-                        else if (std::find(ratesForResolution.begin(), ratesForResolution.end(), app.settings().videoPreferredFrameRate100) != ratesForResolution.end())
-                        {
-                            preferred = app.settings().videoPreferredFrameRate100;
-                        }
-                        app.setVideoFrameRate100(preferred);
                     }
+                    app.setVideoCaptureMode(width, height, preferred);
                 }
             }
         }
@@ -670,7 +681,7 @@ void OverlayUI::drawMenuWindow(Application& app)
     refreshRateOptions100.reserve(videoModes_.size());
     for (const auto& mode : videoModes_)
     {
-        if (mode.width == selectedWidth && mode.height == selectedHeight)
+        if (mode.width == selectedWidth && mode.height == selectedHeight && matchesFormat(mode))
         {
             const std::uint32_t rate100 = static_cast<std::uint32_t>(std::llround(mode.frameRate * 100.0));
             if (rate100 == 0)
@@ -687,17 +698,17 @@ void OverlayUI::drawMenuWindow(Application& app)
 
     const auto frameRateLabel = [&](std::uint32_t rate100) {
         std::ostringstream oss;
-        oss << std::fixed << std::setprecision(2) << (static_cast<double>(rate100) / 100.0) << " Hz";
+        oss << std::fixed << std::setprecision(2) << (static_cast<double>(rate100) / 100.0) << " FPS";
         return oss.str();
     };
 
     std::string refreshLabel = frameRateLabel(app.settings().videoPreferredFrameRate100 != 0 ? app.settings().videoPreferredFrameRate100 : 6000);
     ImGui::SetNextItemWidth(ImGui::GetWindowWidth() * 0.5f);
-    if (ImGui::BeginCombo("Capture Refresh Rate", refreshLabel.c_str()))
+    if (ImGui::BeginCombo("Requested Capture FPS", refreshLabel.c_str()))
     {
         if (refreshRateOptions100.empty())
         {
-            ImGui::TextDisabled("No refresh rates detected for this resolution");
+            ImGui::TextDisabled("No supported frame rates for this resolution / format");
         }
         else
         {
@@ -780,17 +791,27 @@ void OverlayUI::drawMenuWindow(Application& app)
     {
         if (signalRate100 != 0)
         {
-            ImGui::TextDisabled("Current Signal: %ux%u @ %.2f Hz", signalWidth, signalHeight, static_cast<double>(signalRate100) / 100.0);
+            ImGui::TextDisabled("Active capture mode: %ux%u @ %.2f FPS", signalWidth, signalHeight, static_cast<double>(signalRate100) / 100.0);
         }
         else
         {
-            ImGui::TextDisabled("Current Signal: %ux%u", signalWidth, signalHeight);
+            ImGui::TextDisabled("Active capture mode: %ux%u", signalWidth, signalHeight);
         }
     }
     else
     {
-        ImGui::TextDisabled("Current Signal: awaiting frames");
+        ImGui::TextDisabled("Active capture mode: awaiting frames");
     }
+
+    if (!app.captureFormatNotice_.empty())
+    {
+        ImGui::TextWrapped("Driver response: %s", app.captureFormatNotice_.c_str());
+    }
+    if (refreshRateOptions100.size() <= 1)
+    {
+        ImGui::TextWrapped("Frame rates come from the capture driver for this resolution and format. Try Auto or another format/resolution if a high-rate mode is missing.");
+    }
+    ImGui::TextWrapped("The driver validates each request. Active capture mode is the negotiated rate; CAPTURE FPS in the top overlay measures frames actually received.");
 
     ImGui::Spacing();
     ImGui::EndTabItem();

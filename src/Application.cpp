@@ -208,14 +208,14 @@ int Application::run()
     {
         captureStatus_ = ex.what();
         logApp(std::string("[App] DirectShow capture start failed: ") + ex.what());
-        showSettingsMenu();
     }
     catch (...)
     {
         captureStatus_ = "Could not start video capture.";
         logApp("[App] DirectShow capture start failed: unknown exception");
-        showSettingsMenu();
     }
+    syncCaptureDeviceInfo();
+    if (!captureStatus_.empty()) { showSettingsMenu(); }
 
     applyAudioPlaybackSetting();
 
@@ -921,54 +921,32 @@ void Application::selectVideoDevice(const std::string& moniker)
     requestImmediateRender();
 }
 
-void Application::setVideoResolution(std::uint32_t width, std::uint32_t height)
+void Application::setVideoCaptureMode(std::uint32_t width, std::uint32_t height, std::uint32_t frameRate100)
 {
-    if (width == 0 || height == 0)
-    {
-        width = 1920;
-        height = 1080;
-    }
-
-    if (settings_.videoPreferredWidth == width && settings_.videoPreferredHeight == height)
+    if (width == 0 || height == 0 || frameRate100 < 100 || frameRate100 > 100000)
     {
         return;
     }
-
+    if (settings_.videoPreferredWidth == width && settings_.videoPreferredHeight == height &&
+        settings_.videoPreferredFrameRate100 == frameRate100 && captureStatus_.empty())
+    {
+        return;
+    }
     settings_.videoPreferredWidth = width;
     settings_.videoPreferredHeight = height;
-    if (settings_.videoPreferredFrameRate100 == 0)
-    {
-        settings_.videoPreferredFrameRate100 = 6000;
-    }
+    settings_.videoPreferredFrameRate100 = frameRate100;
     savePersistentSettings();
-
-    logApp("[App] Video resolution preference -> " + std::to_string(width) + "x" + std::to_string(height));
-
+    std::ostringstream message;
+    message << "[App] Requested capture mode -> " << width << "x" << height << " @ "
+            << std::fixed << std::setprecision(2) << (static_cast<double>(frameRate100) / 100.0) << " FPS";
+    logApp(message.str());
     restartVideoCapture();
     requestImmediateRender();
 }
 
 void Application::setVideoFrameRate100(std::uint32_t frameRate100)
 {
-    if (frameRate100 == 0)
-    {
-        frameRate100 = 6000;
-    }
-
-    if (settings_.videoPreferredFrameRate100 == frameRate100)
-    {
-        return;
-    }
-
-    settings_.videoPreferredFrameRate100 = frameRate100;
-    savePersistentSettings();
-    std::ostringstream oss;
-    oss << "[App] Video frame-rate preference -> " << std::fixed << std::setprecision(2)
-        << (static_cast<double>(frameRate100) / 100.0) << " Hz";
-    logApp(oss.str());
-
-    restartVideoCapture();
-    requestImmediateRender();
+    setVideoCaptureMode(settings_.videoPreferredWidth, settings_.videoPreferredHeight, frameRate100);
 }
 
 void Application::selectAudioDevice(const std::string& moniker)
@@ -1741,6 +1719,14 @@ void Application::restartVideoCapture()
     previewFrameCount_ = 0;
     skippedFrameCount_ = 0;
     nextStatsRefresh_ = {};
+    currentSourceWidth_.store(0, std::memory_order_release);
+    currentSourceHeight_.store(0, std::memory_order_release);
+    currentSourceFrameRate100_.store(0, std::memory_order_release);
+    pendingSourceWidth_.store(0, std::memory_order_release);
+    pendingSourceHeight_.store(0, std::memory_order_release);
+    pendingSourceFrameRate100_.store(0, std::memory_order_release);
+    sourceChangePending_.store(false, std::memory_order_release);
+    captureFormatNotice_.clear();
 
     try
     {
@@ -1767,6 +1753,19 @@ void Application::restartVideoCapture()
         captureStatus_ = "Could not start video capture.";
         logApp("[App] Failed to restart capture: unknown error");
     }
+    syncCaptureDeviceInfo();
+}
+
+void Application::syncCaptureDeviceInfo()
+{
+    const auto info = directShowCapture_.deviceInfo();
+    if (!info.moniker.empty() && settings_.videoDeviceMoniker != info.moniker)
+    {
+        settings_.videoDeviceMoniker = info.moniker;
+        savePersistentSettings();
+    }
+    captureFormatNotice_ = info.warning;
+    overlay_.refreshCaptureCapabilities(*this);
 }
 
 void Application::captureWindowPlacementForPersistence()

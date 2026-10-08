@@ -48,6 +48,7 @@ private:
     void showSettingsMenu();
     void applyAudioPlaybackSetting();
     void restartVideoCapture();
+    void syncCaptureDeviceInfo();
     bool shouldUseVideoAudio() const;
     bool shouldEnableCaptureAudio() const;
     void applySourceDimensions(std::uint32_t width, std::uint32_t height);
@@ -63,7 +64,7 @@ private:
     void selectAudioDevice(const std::string& moniker);
     void setAudioOutputUseDefaultOnly(bool enabled);
     void setAudioOutputDeviceSelected(const std::string& moniker, bool selected);
-    void setVideoResolution(std::uint32_t width, std::uint32_t height);
+    void setVideoCaptureMode(std::uint32_t width, std::uint32_t height, std::uint32_t frameRate100);
     void setVideoFrameRate100(std::uint32_t frameRate100);
     void setVideoAllowResizing(bool enabled);
     void setVideoAspectMode(VideoAspectMode mode);
@@ -102,6 +103,7 @@ private:
     bool classRegistered_ = false;
     bool audioEnabled_ = false;
     std::string captureStatus_;
+    std::string captureFormatNotice_;
 
     AudioPlayback audioPlayback_;
     OverlayUI overlay_;

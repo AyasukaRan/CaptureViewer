@@ -31,6 +31,7 @@ public:
     void toggleMenu(Application& app);
     void hideMenu(Application& app);
     bool isMenuVisible() const { return menuVisible_; }
+    void refreshCaptureCapabilities(Application& app);
 
 private:
     void showMenu(Application& app);

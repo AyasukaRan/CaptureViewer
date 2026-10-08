@@ -16,6 +16,28 @@
 - VSync defaults to off for new settings; existing saved preferences are retained.
 - The window title and icon identify CaptureViewer instead of Nintendo Switch 2.
 
+### Capture frame-rate selection (v1.1.1)
+
+The Capture tab uses capabilities from the already-open capture device. Automatic
+startup selects that same device in the menu. Frame-rate choices include the
+supported RGB/NV12 mode's advertised frame-interval range, rather than only its
+default rate. Choices are filtered by resolution and color format. Changing
+resolution preserves your preferred FPS when available and restarts capture once.
+
+Choose **M > Capture > Capture Format: Auto**, your resolution, then **Requested
+Capture FPS**. The program writes the requested frame interval to the driver,
+reads it back, and verifies the connected stream. A rejected mode stays visible
+as an error so you can choose another mode; a substantially different FPS is not
+silently accepted. Small driver rounding (such as 60 to 59.94) is reported below
+**Active capture mode**. The top **CAPTURE FPS** measures frames actually received.
+
+An advertised interval range does not guarantee that every intermediate rate will
+be accepted. If only 60 FPS remains, try a different capture format/resolution and
+check the device's available USB/HDMI modes. **Refresh devices and modes** restarts
+capture to reread capabilities. This viewer accepts uncompressed RGB/NV12 with
+`FORMAT_VideoInfo`; compressed formats and `FORMAT_VideoInfo2` are not advertised
+as usable. See Microsoft's [capture-format configuration guidance](https://learn.microsoft.com/en-us/windows/win32/directshow/configure-the-video-output-format).
+
 ### What the performance readings mean
 
 **App latency** is elapsed time from this application's DirectShow buffer callback
