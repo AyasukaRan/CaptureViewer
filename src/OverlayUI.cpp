@@ -79,7 +79,7 @@ bool OverlayUI::initialize(HWND hwnd, D3DRenderer& renderer)
     const ImVec4 switchBg2(46.0f / 255.0f, 46.0f / 255.0f, 46.0f / 255.0f, 0.97f);
     const ImVec4 switchBg3(60.0f / 255.0f, 60.0f / 255.0f, 60.0f / 255.0f, 0.97f);
     const ImVec4 switchText(231.0f / 255.0f, 231.0f / 255.0f, 231.0f / 255.0f, 1.0f);
-    const ImVec4 switchTextDisabled(98.0f / 255.0f, 98.0f / 255.0f, 98.0f / 255.0f, 1.0f);
+    const ImVec4 switchTextDisabled(150.0f / 255.0f, 150.0f / 255.0f, 150.0f / 255.0f, 1.0f);
     const ImVec4 switchAccent(45.0f / 255.0f, 177.0f / 255.0f, 228.0f / 255.0f, 1.0f);
     const ImVec4 switchAccent2(35.0f / 255.0f, 137.0f / 255.0f, 177.0f / 255.0f, 1.0f);
     const ImVec4 switchAccent3(50.0f / 255.0f, 196.0f / 255.0f, 253.0f / 255.0f, 1.0f);
@@ -413,7 +413,7 @@ void OverlayUI::drawMenuWindow(Application& app)
     ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight));
 
     ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
-    if (!ImGui::Begin("Viewer Settings", &menuVisible_, windowFlags))
+    if (!ImGui::Begin("CaptureViewer Settings", &menuVisible_, windowFlags))
     {
         ImGui::End();
         if (!menuVisible_)
@@ -453,7 +453,7 @@ void OverlayUI::drawMenuWindow(Application& app)
             app.setShowLatencyOverlay(showOverlay);
         }
         ImGui::PopStyleVar();
-        ImGui::TextWrapped("Frame policy: Latest frame only. Older frames are discarded when preview falls behind. VSync is off by default to reduce waiting; enabling it avoids tearing.");
+        ImGui::TextWrapped("Latest frame only: old frames are skipped. Disable VSync for lower latency; enable it to reduce tearing.");
         ImGui::Spacing();
         ImGui::SeparatorText("Resolution scaling");
         const char* scalingModes[] = {"Stretch to window", "Fit (keep aspect ratio)", "Native (downscale only)",
@@ -488,7 +488,7 @@ void OverlayUI::drawMenuWindow(Application& app)
                 ImGui::EndTable();
             }
         }
-        ImGui::TextWrapped("Scaling changes the preview only. Choose the capture resolution and frame rate in the Capture tab. Custom 100%% means one source pixel per display pixel; larger images are cropped at the window edges.");
+        ImGui::TextWrapped("Preview scaling only; the Capture tab changes the input format. Custom 100%% = one source pixel per display pixel. Larger images are cropped.");
         RECT client{};
         if (GetClientRect(app.hwnd(), &client))
         {
@@ -506,9 +506,11 @@ void OverlayUI::drawMenuWindow(Application& app)
         if (ImGui::Button("Recenter window")) { app.recenterWindow(); }
         ImGui::EndDisabled();
         ImGui::Spacing();
-        ImGui::SeparatorText("Performance readings");
+        if (ImGui::CollapsingHeader("About performance readings"))
+        {
         ImGui::TextWrapped("App latency measures receipt of a video frame through the return of its Present call. Average and peak cover up to 120 completed video frames. It is not HDMI-to-screen latency.");
         ImGui::TextWrapped("Capture FPS counts video callbacks; Preview FPS counts new video frames successfully submitted for presentation. The overlay refreshes idle status at most four times per second, and FPS updates every half second. GPU scanout is not measured.");
+        }
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Capture"))

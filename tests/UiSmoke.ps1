@@ -66,7 +66,7 @@ function Send-Shortcut([int]$VirtualKey, [int]$ScanCode) {
     }
 }
 
-function Save-WindowScreenshot {
+function Save-WindowScreenshot([string]$FileName = 'window.png') {
     $bitmap = $null
     $graphics = $null
     try {
@@ -82,8 +82,8 @@ function Save-WindowScreenshot {
         $bitmap = [Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
         $graphics = [Drawing.Graphics]::FromImage($bitmap)
         $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
-        $bitmap.Save((Join-Path $outputPath 'window.png'), [Drawing.Imaging.ImageFormat]::Png)
-        Write-Report "Screenshot saved: window.png ($($bounds.Width) x $($bounds.Height)); desktop capture is best-effort."
+        $bitmap.Save((Join-Path $outputPath $FileName), [Drawing.Imaging.ImageFormat]::Png)
+        Write-Report "Screenshot saved: $FileName ($($bounds.Width) x $($bounds.Height)); desktop capture is best-effort."
     }
     catch {
         Write-Report "WARNING: Screenshot unavailable on this runner desktop: $($_.Exception.Message)"
@@ -144,6 +144,23 @@ namespace CaptureViewerSmoke {
     } while ($timer.Elapsed.TotalSeconds -lt 10)
     if (-not $windowReady) { throw 'No CaptureViewer window appeared within 10 seconds.' }
     Write-Report "PASS: main window title '$($viewerProcess.MainWindowTitle)', PID $($viewerProcess.Id)."
+
+    $renderLoopReady = $false
+    do {
+        Assert-ViewerAlive
+        $viewerLog = ''
+        try { $viewerLog = Get-Content -LiteralPath (Join-Path $runDirectory 'viewer.log') -Raw }
+        catch { }
+        if ($viewerLog -match '\[App\] Entering render loop') {
+            $renderLoopReady = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    } while ($timer.Elapsed.TotalSeconds -lt 10)
+    if (-not $renderLoopReady) { throw 'Viewer did not enter its render loop within 10 seconds.' }
+    Start-Sleep -Milliseconds 500
+    Assert-ViewerAlive
+    Save-WindowScreenshot 'initial.png'
 
     Send-Shortcut 0x7A 0x57 # F11
     Wait-Setting 'videoFullscreen' $true

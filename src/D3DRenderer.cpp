@@ -793,7 +793,8 @@ bool D3DRenderer::uploadFrame(const void* data,
     return true;
 }
 
-bool D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback)
+bool D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback,
+                         bool drawVideo)
 {
     if (!swapChain_ || !commandQueue_ || !commandList_ || !presentationSlotReady_)
     {
@@ -918,7 +919,7 @@ bool D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& 
     ID3D12DescriptorHeap* heaps[] = {srvHeap_.Get(), samplerHeap_.Get()};
     // A missing capture device still has a usable settings UI. Never sample
     // the uninitialized video descriptor before the first uploaded frame.
-    if (frameTexture_)
+    if (frameTexture_ && drawVideo)
     {
         commandList_->SetGraphicsRootSignature(rootSignature_.Get());
         ID3D12PipelineState* activePso = (frameFormat_ == FrameFormat::NV12 && pipelineStateNv12_)

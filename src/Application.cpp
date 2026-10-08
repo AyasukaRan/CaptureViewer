@@ -335,6 +335,18 @@ LRESULT CALLBACK Application::windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
     switch (msg)
     {
+    case WM_ERASEBKGND:
+        // Direct3D owns the entire client area; GDI erases can cover the HUD
+        // after switching between decorated and borderless window styles.
+        return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        BeginPaint(hwnd, &paint);
+        EndPaint(hwnd, &paint);
+        self->requestImmediateRender();
+        return 0;
+    }
     case WM_SIZE:
     {
         const UINT width = LOWORD(lParam);
@@ -432,7 +444,7 @@ bool Application::createWindow(int width, int height)
     wc.lpfnWndProc = &Application::windowProc;
     wc.hInstance = GetModuleHandle(nullptr);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = kWindowClassName;
 
     const HICON classIcon = static_cast<HICON>(LoadImageW(GetModuleHandle(nullptr),
@@ -1364,10 +1376,20 @@ bool Application::renderFrame(bool forcePresent)
         return false;
     }
     const bool uploaded = uploadLatestFrame();
-    if (!uploaded && frameCounter_.load(std::memory_order_acquire) > lastPresentedFrame_)
+    const bool uploadFailed = !uploaded && frameCounter_.load(std::memory_order_acquire) > lastPresentedFrame_;
+    if (uploadFailed)
     {
-        // Retry the newest frame later rather than presenting an older snapshot.
-        return false;
+        captureStatus_ = "Cannot preview this frame. Try a different capture resolution or pixel format.";
+        // Keep settings usable even for unsupported frames. Do not sample a
+        // newly allocated texture until it has received a valid upload.
+        if (!menuVisible && !forced && !statsRefresh)
+        {
+            return false;
+        }
+    }
+    else if (uploaded)
+    {
+        captureStatus_.clear();
     }
 
     if (hwnd_)
@@ -1395,7 +1417,7 @@ bool Application::renderFrame(bool forcePresent)
 
     const bool presented = renderer_.render([&](ID3D12GraphicsCommandList* cmdList) {
         overlay_.render(cmdList);
-    });
+    }, !uploadFailed);
     if (presented && uploaded)
     {
         // Only successful, unique captured frames contribute to preview FPS and

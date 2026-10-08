@@ -38,7 +38,8 @@ public:
                      std::uint32_t height,
                      FrameFormat format);
 
-    bool render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback = nullptr);
+    bool render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback = nullptr,
+                bool drawVideo = true);
     [[nodiscard]] std::chrono::steady_clock::time_point lastPresentReturnTime() const { return lastPresentReturnTime_; }
 
     void setVSyncEnabled(bool enable) { vsyncEnabled_ = enable; }
